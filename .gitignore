@@ -1,0 +1,7 @@
+.cursor/
+.env
+.venv
+.vscode
+.env*
+proposal/
+docs/
