@@ -85,6 +85,13 @@ Implement in `salesbench/core/protocol.py`:
 
 ## Tools (minimal MVP)
 
+### Tool access (explicit)
+
+- **Seller tool access**: may call `crm.*`, `calendar.*`, and `calling.*` tools (subject to budgets/termination enforced by the Orchestrator and Environment).
+- **Buyer tool access**: none. The buyer never issues tool calls; it is invoked internally by the `calling.propose_plan` tool and can only return a Decision.
+- **Orchestrator tool access**: none directly. It routes seller tool calls to `SalesEnv.execute_tool(...)` and advances time/budgets/termination.
+- **Environment tool access**: executes all tools and applies state transitions; it is the only canonical owner of side effects.
+
 ### CRM
 
 - `crm.search_leads(filters)`
