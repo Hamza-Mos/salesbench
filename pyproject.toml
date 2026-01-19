@@ -24,6 +24,10 @@ classifiers = [
 ]
 dependencies = [
     "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0",
+    "verifiers>=0.1.8",
+    "datasets>=2.14.0",
+    "openai>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -32,18 +36,35 @@ llm = [
     "anthropic>=0.18.0",
     "google-generativeai>=0.4.0",
 ]
+telemetry = [
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-exporter-otlp>=1.20.0",
+]
+storage = [
+    "supabase>=2.0.0",
+]
+server = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "pytest-asyncio>=0.21.0",
     "mypy>=1.0.0",
     "ruff>=0.1.0",
+    "pre-commit>=3.0.0",
 ]
 all = [
-    "salesbench[llm,dev]",
+    "salesbench[llm,telemetry,storage,server,dev]",
 ]
 
 [project.scripts]
 salesbench = "salesbench.cli.main:main"
+
+[project.entry-points."verifiers.envs"]
+salesbench = "salesbench:load_environment"
 
 [project.urls]
 Homepage = "https://github.com/salesbench/salesbench"
@@ -51,18 +72,25 @@ Documentation = "https://github.com/salesbench/salesbench#readme"
 Repository = "https://github.com/salesbench/salesbench"
 
 [tool.hatch.build.targets.wheel]
-packages = ["environments/salesbench"]
+packages = ["salesbench"]
 
-[tool.hatch.build.targets.wheel.sources]
-"environments" = ""
+[tool.verifiers.eval]
+environment = "salesbench:load_environment"
+default_seed = 42
+num_leads = 100
+total_days = 10
+max_calls_per_day = 50
+pass_threshold = 0
 
-[tool.hatch.build.targets.editable]
-dev-mode-dirs = ["environments"]
+[tool.verifiers.eval.metrics]
+primary = "total_score"
+secondary = ["acceptance_rate", "revenue", "efficiency"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+asyncio_mode = "auto"
 
 [tool.mypy]
 python_version = "3.10"
@@ -75,5 +103,16 @@ target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "W"]
-ignore = ["E501"]
+select = ["E", "F", "I", "W"]
+ignore = [
+    "E501",   # Line too long (handled by formatter)
+    "E402",   # Module level import not at top of file
+    "E722",   # Do not use bare except
+    "E741",   # Ambiguous variable name
+    "F401",   # Imported but unused (in validation scripts)
+    "F841",   # Local variable assigned but never used
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["F401", "F841"]  # Validation scripts intentionally import to test
+"tests/*" = ["E741"]  # Allow in tests
