@@ -1,3 +1,9 @@
+---
+name: ""
+overview: ""
+todos: []
+---
+
 ## Goals
 
 - **Prime Intellect compatible**: publishable Verifiers environment with `load_environment(...) -> vf.Environment`.
@@ -43,8 +49,6 @@ loop multi_turn
   Env-->>VF: observation/messages + tool_results
 end
 ```
-
-
 
 ## Protocol (single source of truth)
 
@@ -391,8 +395,6 @@ salesbench/
       main.py                   # optional runner entrypoint
 ```
 
-
-
 ## Implementation plan (MVP-first)
 
 1. **Publishable Verifiers environment** (`environments/salesbench/`): implement `load_environment(...)` and default eval config.
@@ -401,4 +403,6 @@ salesbench/
 4. **Environment + tools**: canonical state + CRM/Calendar/Calling tools; buyer invoked only inside calling tool.
 5. **Orchestrator**: 10-day portfolio loop, budgets/termination, call session flow.
 6. **Rubric**: reward + metrics; pass^k aggregation hooks.
+
 7. **Baselines**: heuristic seller + LLM seller; constrained buyer LLM sim.
+8. **Optional ops layer**: Supabase + OTel/Grafana integrations outside the publishable env package.

@@ -1,0 +1,225 @@
+# Prime Intellect Environment Hub Configuration
+# https://docs.primeintellect.ai/env-hub
+
+name: salesbench
+version: 0.1.0
+description: AI Social Intelligence Benchmark - Life Insurance Cold-Calling
+
+# Environment metadata
+environment:
+  entry_point: salesbench:load_environment
+  class: salesbench:SalesBenchToolEnv
+
+  # Default configuration
+  defaults:
+    seed: 42
+    num_leads: 100
+    total_days: 10
+    max_calls_per_day: 50
+    buyer_model: gpt-4o-mini
+    buyer_temperature: 0.3
+    num_episodes: 100
+    max_turns: 100
+
+  # Configuration schema
+  config_schema:
+    seed:
+      type: integer
+      description: Random seed for reproducibility
+      default: 42
+    num_leads:
+      type: integer
+      description: Number of leads to generate
+      default: 100
+      min: 1
+      max: 1000
+    total_days:
+      type: integer
+      description: Total simulated business days
+      default: 10
+      min: 1
+      max: 30
+    max_calls_per_day:
+      type: integer
+      description: Maximum calls allowed per day
+      default: 50
+    buyer_model:
+      type: string
+      description: LLM model for buyer simulator
+      default: gpt-4o-mini
+    buyer_temperature:
+      type: float
+      description: Temperature for buyer LLM
+      default: 0.3
+      min: 0.0
+      max: 2.0
+    num_episodes:
+      type: integer
+      description: Number of episodes in dataset
+      default: 100
+    max_turns:
+      type: integer
+      description: Maximum turns per episode
+      default: 100
+
+# Scoring configuration
+scoring:
+  # Reward scale
+  min_score: -10000
+  max_score: 100000
+
+  # Primary success metric
+  primary_metric: total_score
+
+  # Pass threshold (any acceptance = pass)
+  pass_threshold: 0
+
+  # Score components (for interpretability)
+  components:
+    - name: accept_rewards
+      weight: 100
+      description: Base reward per acceptance
+    - name: premium_rewards
+      weight: 1
+      description: Monthly premium multiplier
+    - name: close_bonuses
+      weight: 50
+      description: Bonus for immediate close
+    - name: reject_penalties
+      weight: -5
+      description: Penalty per rejection
+    - name: dnc_penalties
+      weight: -200
+      description: Penalty for DNC violation
+
+# Verifier configuration
+verifier:
+  # Verifier entry point
+  entry_point: salesbench.envs.sales_mvp.verifiers:calculate_episode_score
+
+  # Verification mode
+  mode: deterministic  # Scoring is deterministic given state
+
+  # Output schema
+  output_schema:
+    total_score:
+      type: float
+      description: Final episode score
+    num_accepts:
+      type: integer
+      description: Number of accepted offers
+    num_rejects:
+      type: integer
+      description: Number of rejected offers
+    num_dnc_violations:
+      type: integer
+      description: Number of DNC violations
+
+# Observation space
+observation:
+  type: dict
+  description: |
+    Observation includes:
+    - time: Current day, hour, remaining minutes
+    - call: In-call status, current lead, duration
+    - metrics: Running totals (calls, accepts, rejects)
+    - leads_summary: Available leads by temperature
+    - tools: Available tool schemas
+    - last_tool_results: Results from previous actions
+
+# Action space
+action:
+  type: tool_calls
+  description: |
+    List of ToolCall objects with:
+    - tool_name: Name of tool to execute
+    - arguments: Dict of tool arguments
+    - call_id: Optional unique identifier
+
+  tools:
+    # CRM Tools
+    - name: crm_search_leads
+      description: Search for leads matching criteria (temperature, income, age)
+    - name: crm_get_lead
+      description: Get detailed information about a specific lead
+    - name: crm_update_lead
+      description: Update a lead's notes or temperature classification
+    - name: crm_log_call
+      description: Log a completed call with its outcome
+
+    # Calendar Tools
+    - name: calendar_get_availability
+      description: Get available time slots for scheduling calls
+    - name: calendar_schedule_call
+      description: Schedule a call with a lead
+
+    # Calling Tools
+    - name: calling_start_call
+      description: Start a call with a lead
+    - name: calling_propose_plan
+      description: Propose an insurance plan to the buyer
+    - name: calling_end_call
+      description: End the current call
+
+    # Product Tools
+    - name: products_list_plans
+      description: List all available insurance plans
+    - name: products_get_plan
+      description: Get detailed information about a specific plan
+    - name: products_quote_premium
+      description: Get a premium quote for a plan
+
+# Evaluation settings
+evaluation:
+  # Number of episodes for evaluation
+  num_episodes: 100
+
+  # Seeds to use (deterministic evaluation)
+  seeds: range(0, 100)
+
+  # Parallelism
+  max_parallel: 10
+
+  # Metrics to report
+  metrics:
+    - name: mean_score
+      aggregation: mean
+      field: total_score
+    - name: pass_rate
+      aggregation: mean
+      field: has_accepts
+      description: Percentage of episodes with at least one acceptance
+    - name: mean_accepts
+      aggregation: mean
+      field: num_accepts
+    - name: total_accepts
+      aggregation: sum
+      field: num_accepts
+
+# Requirements
+requirements:
+  python: ">=3.10"
+  packages:
+    - verifiers>=0.1.8
+    - openai>=1.0.0
+    - python-dotenv>=1.0.0
+    - pydantic>=2.0.0
+    - datasets>=2.14.0
+
+  # Environment variables
+  env_vars:
+    required:
+      - OPENAI_API_KEY
+    optional:
+      - SALESBENCH_BUYER_MODEL
+      - SALESBENCH_BUYER_TEMPERATURE
+
+# Tags for discovery
+tags:
+  - social-intelligence
+  - sales
+  - negotiation
+  - tool-use
+  - multi-turn
+  - rl-ready
+  - verifiers-compatible
