@@ -104,9 +104,9 @@ class SellerAgent(ABC):
 
     Seller agents:
     - Receive observations (environment state + tool results)
-    - Output actions (tool calls)
-    - Cannot produce free-form text to the buyer
-    - Must use tools for all interactions
+    - Output actions containing messages and/or tool calls
+    - Messages are free-form text sent to the buyer (the actual conversation)
+    - Tool calls are for analytics/operations (CRM, propose_plan for tracking, etc.)
     """
 
     def __init__(self, config: Optional[SellerConfig] = None):
@@ -121,13 +121,13 @@ class SellerAgent(ABC):
 
     @abstractmethod
     def act(self, observation: SellerObservation) -> SellerAction:
-        """Decide which tools to call based on observation.
+        """Decide what to say and which tools to call based on observation.
 
         Args:
             observation: Current observation from environment.
 
         Returns:
-            SellerAction containing tool calls.
+            SellerAction containing message and/or tool calls.
         """
         pass
 
@@ -147,17 +147,22 @@ class SellerAgent(ABC):
             "turn_count": self._turn_count,
         }
 
-    def _create_action(self, tool_calls: list[ToolCall]) -> SellerAction:
+    def _create_action(
+        self,
+        tool_calls: Optional[list[ToolCall]] = None,
+        message: Optional[str] = None,
+    ) -> SellerAction:
         """Helper to create and validate an action.
 
         Args:
-            tool_calls: List of tool calls to make.
+            tool_calls: List of tool calls to make (optional).
+            message: Free-form text to send to the buyer (optional).
 
         Returns:
             Validated SellerAction.
         """
         self._turn_count += 1
-        action = SellerAction(tool_calls=tool_calls)
+        action = SellerAction(tool_calls=tool_calls or [], message=message)
         return validate_seller_action(action)
 
     def _track_cost(self, input_tokens: int, output_tokens: int, model: str) -> float:

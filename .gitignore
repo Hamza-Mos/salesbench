@@ -4,3 +4,6 @@
 .env*
 proposal/
 docs/
+__pycache__/
+*.pyc
+.cursor/

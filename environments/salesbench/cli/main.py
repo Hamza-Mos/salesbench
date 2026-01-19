@@ -283,34 +283,43 @@ def run_episode_command(args: argparse.Namespace) -> int:
         # Convert dict to SellerObservation for the agent
         obs = dict_to_observation(obs_dict)
 
-        # LLM agent generates tool calls
+        # LLM agent generates action (message + tool calls)
         try:
-            tool_calls = seller_agent.act(obs, tool_schemas)
+            action = seller_agent.act(obs, tool_schemas)
         except Exception as e:
             print(f"\nError from LLM seller: {e}")
             break
 
-        if not tool_calls:
-            print(f"\nTurn {turn}: Agent returned no tool calls, ending episode.")
+        # Extract tool calls from action
+        tool_calls = action.tool_calls if action else []
+        message = action.message if action else None
+
+        if not tool_calls and not message:
+            print(f"\nTurn {turn}: Agent returned no action, ending episode.")
             break
 
-        result = orchestrator.step(tool_calls)
+        # Step environment with tool calls (message is handled separately)
+        result = orchestrator.step(tool_calls) if tool_calls else None
 
         if args.verbose:
             print(f"\nTurn {turn}:")
+            if message:
+                print(f"  💬 {message[:200]}{'...' if len(message) > 200 else ''}")
             for tc in tool_calls:
                 print(f"  → {tc.tool_name}({tc.arguments})")
-            for tr in result.tool_results:
-                status = "OK" if tr.success else "FAIL"
-                print(f"  ← [{status}] {tr.data or tr.error}")
+            if result:
+                for tr in result.tool_results:
+                    status = "OK" if tr.success else "FAIL"
+                    print(f"  ← [{status}] {tr.data or tr.error}")
 
-        if result.terminated:
+        if result and result.terminated:
             print(f"\nEpisode terminated: {result.termination_reason}")
             break
 
-        obs_dict = result.observation
-        # CRITICAL: Include tool results in the observation for the agent
-        obs_dict["last_tool_results"] = [tr.to_dict() for tr in result.tool_results]
+        if result:
+            obs_dict = result.observation
+            # CRITICAL: Include tool results in the observation for the agent
+            obs_dict["last_tool_results"] = [tr.to_dict() for tr in result.tool_results]
 
     # Print final results
     final = orchestrator.get_final_result()

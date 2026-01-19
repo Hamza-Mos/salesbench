@@ -141,11 +141,12 @@ class CallingTools:
         coverage_amount: float,
         next_step: str,
         term_years: Optional[int] = None,
-        pitch: Optional[str] = None,
     ) -> ToolResult:
-        """Present an insurance plan to the buyer.
+        """Record a plan offer for analytics.
 
-        This invokes the buyer simulator to get a decision.
+        This is purely analytical - it records the structured offer data
+        for tracking purposes. The actual conversation with the buyer
+        happens through the seller's message text.
 
         Args:
             plan_id: The plan type (TERM, WHOLE, UL, VUL, LTC, DI).
@@ -153,10 +154,9 @@ class CallingTools:
             coverage_amount: Coverage amount.
             next_step: Proposed next step (schedule_followup, request_info, close_now).
             term_years: Term length for TERM plans.
-            pitch: Optional sales pitch text.
 
         Returns:
-            ToolResult with buyer decision.
+            ToolResult confirming the offer was recorded.
         """
         # Check for active call
         if self.state.active_call is None:
@@ -364,7 +364,6 @@ class CallingTools:
                 coverage_amount=arguments["coverage_amount"],
                 next_step=arguments["next_step"],
                 term_years=arguments.get("term_years"),
-                pitch=arguments.get("pitch"),
             )
 
         elif method_name == "end_call":

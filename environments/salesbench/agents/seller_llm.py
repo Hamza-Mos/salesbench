@@ -10,7 +10,7 @@ Supports multiple LLM providers via the modular adapter:
 """
 
 import json
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from salesbench.core.types import ToolCall, PlanType, NextStep
 from salesbench.core.protocol import SellerAction, SELLER_TOOLS, get_all_tool_schemas
@@ -24,16 +24,24 @@ from salesbench.llm import create_client, detect_available_provider, LLMClient
 
 SELLER_SYSTEM_PROMPT = """You are an AI insurance sales agent. Your goal is to sell insurance plans to leads.
 
+## HOW YOU COMMUNICATE
+
+You have two types of output:
+1. **Message**: Free-form text that the buyer sees (your actual conversation)
+2. **Tool calls**: Operational/analytical actions (CRM, analytics, etc.)
+
+When in a call, your MESSAGE is what the buyer hears. Tool calls like `calling.propose_plan` are purely for ANALYTICS - they record the offer details but do NOT speak to the buyer. You must write your pitch in the message.
+
 ## CRITICAL WORKFLOW - State Machine
 
 You are in one of these states:
 1. **NO_LEADS** → Search for leads with `crm.search_leads`
 2. **HAVE_LEADS** → Call a lead with `calling.start_call(lead_id="...")`
-3. **IN_CALL** → Make an offer with `calling.propose_plan` or end with `calling.end_call`
+3. **IN_CALL** → Send a message to pitch your offer, use `calling.propose_plan` to record it analytically
 
 ### STATE TRANSITIONS:
 - NO_LEADS + search returns leads → HAVE_LEADS (next: start_call)
-- HAVE_LEADS + start_call → IN_CALL (next: propose_plan)
+- HAVE_LEADS + start_call → IN_CALL (next: message + propose_plan)
 - IN_CALL + call ends → HAVE_LEADS (call next lead) or NO_LEADS (search more)
 
 ## ⚠️ CRITICAL RULES - READ CAREFULLY
@@ -41,6 +49,7 @@ You are in one of these states:
 1. **NEVER search twice in a row.** If you just searched and got leads, your ONLY valid action is `calling.start_call`.
 2. **Use the lead_id from search results.** The "Next Action" section shows you exactly which lead_id to use.
 3. **If search returns 0 leads**, try a different temperature: hot → warm → lukewarm → cold.
+4. **When pitching a plan**, write your pitch in the MESSAGE and call `propose_plan` to record the offer details.
 
 ## Available Tools
 
@@ -52,7 +61,7 @@ You are in one of these states:
 
 ### Calling Tools
 - `calling.start_call`: Start call with a lead - REQUIRES lead_id from search results
-- `calling.propose_plan`: Present offer with plan_id, monthly_premium, coverage_amount, next_step
+- `calling.propose_plan`: **ANALYTICS ONLY** - Records the offer details. Does NOT speak to buyer. Use your message to pitch.
 - `calling.end_call`: End current call
 
 ### Product Tools
@@ -75,11 +84,12 @@ You are in one of these states:
 ```
 Turn 1: crm.search_leads(temperature="hot")
         → Returns: lead_abc123, lead_xyz789
-Turn 2: calling.start_call(lead_id="lead_abc123")  ← USE THE LEAD ID!
-        → Call connected
-Turn 3: calling.propose_plan(plan_id="TERM", monthly_premium=150, coverage_amount=500000, next_step="close_now")
-Turn 4: calling.end_call() or propose again based on response
-Turn 5: calling.start_call(lead_id="lead_xyz789")  ← CALL NEXT LEAD
+Turn 2: calling.start_call(lead_id="lead_abc123")
+        → Call connected with John, age 35, $80k income, 2 dependents
+Turn 3: MESSAGE: "Hi John! I'm calling about some great term life options for your family..."
+        + calling.propose_plan(plan_id="TERM", monthly_premium=150, coverage_amount=500000, next_step="close_now")
+Turn 4: [Based on buyer response] MESSAGE: "I understand your concern about the premium..."
+        + calling.end_call() or another propose_plan
 ```
 
 ## WRONG - Do Not Do This
@@ -87,10 +97,13 @@ Turn 5: calling.start_call(lead_id="lead_xyz789")  ← CALL NEXT LEAD
 ```
 Turn 1: crm.search_leads(temperature="hot") → Returns leads
 Turn 2: crm.search_leads(temperature="hot") ← WRONG! You already have leads!
-Turn 3: crm.search_leads(temperature="hot") ← WRONG! Call a lead instead!
 ```
 
-If you have leads, CALL THEM. Do not search again until you've called all your leads."""
+```
+Turn 3: calling.propose_plan(...) with NO MESSAGE ← WRONG! The buyer won't hear anything!
+```
+
+If you have leads, CALL THEM. When pitching, ALWAYS include a message."""
 
 
 def _to_api_name(tool_name: str) -> str:
@@ -177,15 +190,15 @@ class LLMSellerAgent(SellerAgent):
         self._available_leads = []
         self._called_lead_ids = set()
 
-    def act(self, observation: SellerObservation, tools: Optional[list] = None) -> list[ToolCall]:
-        """Decide which tools to call using LLM.
+    def act(self, observation: SellerObservation, tools: Optional[list] = None) -> SellerAction:
+        """Decide what to say and which tools to call using LLM.
 
         Args:
             observation: Current observation from environment.
             tools: Optional tool schemas (uses built-in if not provided).
 
         Returns:
-            List of ToolCall objects.
+            SellerAction containing message and/or tool calls.
         """
         # Build user message from observation (also updates lead tracking)
         user_message = self._build_user_message(observation)
@@ -196,8 +209,8 @@ class LLMSellerAgent(SellerAgent):
             "content": user_message,
         })
 
-        # Get LLM response
-        tool_calls = self._call_llm(user_message)
+        # Get LLM response (returns message and tool_calls)
+        message, tool_calls = self._call_llm(user_message)
 
         # HARD CONSTRAINT: Intercept redundant search_leads when we have uncalled leads
         # This prevents models from looping on search forever
@@ -223,12 +236,16 @@ class LLMSellerAgent(SellerAgent):
             tool_calls = corrected_calls
 
         # Add assistant response to history
+        assistant_content = message or ""
+        if tool_calls:
+            assistant_content += f"\n[Tool calls: {json.dumps([tc.to_dict() for tc in tool_calls])}]"
         self._conversation_history.append({
             "role": "assistant",
-            "content": json.dumps([tc.to_dict() for tc in tool_calls]),
+            "content": assistant_content,
         })
 
-        return tool_calls
+        self._turn_count += 1
+        return SellerAction(tool_calls=tool_calls, message=message)
 
     def _build_user_message(self, obs: SellerObservation) -> str:
         """Build user message from observation."""
@@ -333,8 +350,13 @@ class LLMSellerAgent(SellerAgent):
 
         return "\n".join(lines)
 
-    def _call_llm(self, user_message: str) -> list[ToolCall]:
-        """Call LLM API with function calling."""
+    def _call_llm(self, user_message: str) -> Tuple[Optional[str], list[ToolCall]]:
+        """Call LLM API with function calling.
+        
+        Returns:
+            Tuple of (message, tool_calls) where message is optional free-form text
+            and tool_calls is a list of tool calls.
+        """
         client = self._get_client()
 
         messages = [{"role": "system", "content": SELLER_SYSTEM_PROMPT}]
@@ -349,8 +371,12 @@ class LLMSellerAgent(SellerAgent):
             # Fallback to JSON-based tool calling
             return self._call_with_json(client, messages)
 
-    def _call_with_tools(self, client: LLMClient, messages: list) -> list[ToolCall]:
-        """Call using OpenAI-style tool calling."""
+    def _call_with_tools(self, client: LLMClient, messages: list) -> Tuple[Optional[str], list[ToolCall]]:
+        """Call using OpenAI-style tool calling.
+        
+        Returns:
+            Tuple of (message, tool_calls).
+        """
         # We need to use the raw OpenAI client for tool calling
         import openai
 
@@ -372,7 +398,7 @@ class LLMSellerAgent(SellerAgent):
             "messages": messages,
             "temperature": self.config.temperature,
             "tools": TOOLS_FOR_LLM,
-            "tool_choice": "auto",  # Let model reason when confused instead of forcing tool calls
+            "tool_choice": "auto",  # Let model output text and/or tools
         }
 
         if uses_new_api:
@@ -390,12 +416,15 @@ class LLMSellerAgent(SellerAgent):
                 client.get_model_name(),
             )
 
-        # Parse tool calls from response
+        # Parse message and tool calls from response
         tool_calls = []
-        message = response.choices[0].message
+        response_message = response.choices[0].message
+        
+        # Get the text content (message to buyer)
+        text_content = response_message.content
 
-        if message.tool_calls:
-            for tc in message.tool_calls:
+        if response_message.tool_calls:
+            for tc in response_message.tool_calls:
                 try:
                     args = json.loads(tc.function.arguments)
                     tool_calls.append(ToolCall(
@@ -406,13 +435,18 @@ class LLMSellerAgent(SellerAgent):
                 except json.JSONDecodeError:
                     continue
 
-        if not tool_calls:
-            tool_calls = self._fallback_action()
+        # If no output at all, use fallback
+        if not tool_calls and not text_content:
+            return None, self._fallback_action()
 
-        return tool_calls
+        return text_content, tool_calls
 
-    def _call_anthropic(self, client: LLMClient, messages: list) -> list[ToolCall]:
-        """Call Anthropic API with tool use."""
+    def _call_anthropic(self, client: LLMClient, messages: list) -> Tuple[Optional[str], list[ToolCall]]:
+        """Call Anthropic API with tool use.
+        
+        Returns:
+            Tuple of (message, tool_calls).
+        """
         import anthropic
 
         if hasattr(client, '_client') and isinstance(client._client, anthropic.Anthropic):
@@ -448,23 +482,32 @@ class LLMSellerAgent(SellerAgent):
             client.get_model_name(),
         )
 
-        # Parse tool calls
+        # Parse text content and tool calls
         tool_calls = []
+        text_content = None
+        
         for content in response.content:
-            if content.type == "tool_use":
+            if content.type == "text":
+                text_content = content.text
+            elif content.type == "tool_use":
                 tool_calls.append(ToolCall(
                     tool_name=_from_api_name(content.name),
                     arguments=content.input,
                     call_id=content.id,
                 ))
 
-        if not tool_calls:
-            tool_calls = self._fallback_action()
+        # If no output at all, use fallback
+        if not tool_calls and not text_content:
+            return None, self._fallback_action()
 
-        return tool_calls
+        return text_content, tool_calls
 
-    def _call_with_json(self, client: LLMClient, messages: list) -> list[ToolCall]:
-        """Call using JSON-based tool calling (for providers without native tool support)."""
+    def _call_with_json(self, client: LLMClient, messages: list) -> Tuple[Optional[str], list[ToolCall]]:
+        """Call using JSON-based tool calling (for providers without native tool support).
+        
+        Returns:
+            Tuple of (message, tool_calls).
+        """
         response = client.complete(
             messages=messages,
             temperature=self.config.temperature,
@@ -474,6 +517,7 @@ class LLMSellerAgent(SellerAgent):
 
         try:
             content = json.loads(response.content)
+            message = content.get("message")
             raw_calls = content.get("tool_calls", [])
 
             tool_calls = []
@@ -484,12 +528,12 @@ class LLMSellerAgent(SellerAgent):
                         arguments=tc_data.get("arguments", {}),
                     ))
 
-            if tool_calls:
-                return tool_calls
+            if tool_calls or message:
+                return message, tool_calls
         except (json.JSONDecodeError, KeyError):
             pass
 
-        return self._fallback_action()
+        return None, self._fallback_action()
 
     def _fallback_action(self) -> list[ToolCall]:
         """Generate a smart fallback action based on current state."""
@@ -534,8 +578,12 @@ class StreamingLLMSellerAgent(LLMSellerAgent):
         super().__init__(config, provider, model, api_key)
         self.on_token = on_token or (lambda x: None)
 
-    def _call_with_tools(self, client: LLMClient, messages: list) -> list[ToolCall]:
-        """Call with streaming for OpenAI-compatible APIs."""
+    def _call_with_tools(self, client: LLMClient, messages: list) -> Tuple[Optional[str], list[ToolCall]]:
+        """Call with streaming for OpenAI-compatible APIs.
+        
+        Returns:
+            Tuple of (message, tool_calls).
+        """
         import openai
 
         if hasattr(client, '_client') and isinstance(client._client, openai.OpenAI):
@@ -553,7 +601,7 @@ class StreamingLLMSellerAgent(LLMSellerAgent):
             "messages": messages,
             "temperature": self.config.temperature,
             "tools": TOOLS_FOR_LLM,
-            "tool_choice": "auto",  # Let model reason when confused instead of forcing tool calls
+            "tool_choice": "auto",  # Let model output text and/or tools
             "stream": True,
         }
 
@@ -566,9 +614,19 @@ class StreamingLLMSellerAgent(LLMSellerAgent):
 
         # Collect streamed content
         tool_calls_data = {}
+        text_content = ""
+        
         for chunk in stream:
-            if chunk.choices[0].delta.tool_calls:
-                for tc in chunk.choices[0].delta.tool_calls:
+            delta = chunk.choices[0].delta
+            
+            # Collect text content
+            if delta.content:
+                text_content += delta.content
+                self.on_token(delta.content)
+            
+            # Collect tool calls
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
                     if tc.index not in tool_calls_data:
                         tool_calls_data[tc.index] = {
                             "id": tc.id or "",
@@ -580,7 +638,6 @@ class StreamingLLMSellerAgent(LLMSellerAgent):
                             tool_calls_data[tc.index]["name"] += tc.function.name
                         if tc.function.arguments:
                             tool_calls_data[tc.index]["arguments"] += tc.function.arguments
-                            self.on_token(tc.function.arguments)
 
         # Parse collected tool calls
         tool_calls = []
@@ -595,10 +652,11 @@ class StreamingLLMSellerAgent(LLMSellerAgent):
             except json.JSONDecodeError:
                 continue
 
-        if not tool_calls:
-            tool_calls = self._fallback_action()
+        # If no output at all, use fallback
+        if not tool_calls and not text_content:
+            return None, self._fallback_action()
 
-        return tool_calls
+        return text_content or None, tool_calls
 
 
 class ReActSellerAgent(LLMSellerAgent):
@@ -615,24 +673,29 @@ class ReActSellerAgent(LLMSellerAgent):
         react_prompt = """
 ## ReAct Instructions
 
-Before deciding on tools, explicitly reason about:
+Before deciding on your response, explicitly reason about:
 1. **Observation**: What do you observe from the current state?
 2. **Thought**: What strategy should you use? Why?
-3. **Action**: What specific tool(s) will you call?
+3. **Action**: What message will you send and/or what tools will you call?
 
 Format your response as:
 {
     "observation": "What I see...",
     "thought": "My reasoning...",
     "action": {
+        "message": "Your message to the buyer (if in a call)",
         "tool_calls": [...]
     }
 }
 """
         return base_message + react_prompt
 
-    def _call_llm(self, user_message: str) -> list[ToolCall]:
-        """Call LLM with ReAct-style prompting."""
+    def _call_llm(self, user_message: str) -> Tuple[Optional[str], list[ToolCall]]:
+        """Call LLM with ReAct-style prompting.
+        
+        Returns:
+            Tuple of (message, tool_calls).
+        """
         client = self._get_client()
 
         messages = [{"role": "system", "content": SELLER_SYSTEM_PROMPT}]
@@ -653,8 +716,9 @@ Format your response as:
                 "thought": content.get("thought", ""),
             }
 
-            # Extract tool calls
+            # Extract message and tool calls
             action = content.get("action", content)
+            message = action.get("message")
             raw_calls = action.get("tool_calls", [])
 
             tool_calls = []
@@ -665,12 +729,12 @@ Format your response as:
                         arguments=tc_data.get("arguments", {}),
                     ))
 
-            if tool_calls:
-                return tool_calls
+            if tool_calls or message:
+                return message, tool_calls
         except (json.JSONDecodeError, KeyError):
             pass
 
-        return self._fallback_action()
+        return None, self._fallback_action()
 
     def get_stats(self) -> dict[str, Any]:
         """Include last reasoning in stats."""
