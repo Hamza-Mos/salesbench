@@ -215,7 +215,9 @@ class CallingTools:
                 success=False,
                 error="Buyer simulator not configured. LLM buyer is required.",
             )
-        buyer_response = self._buyer_simulator(lead, offer, session, pitch)
+        # Note: pitch is no longer passed as a tool argument - the seller's message
+        # is now separate from tool calls. Pass None for backwards compatibility.
+        buyer_response = self._buyer_simulator(lead, offer, session, None)
 
         # Record offer and response
         session.offers_presented.append(offer)
@@ -230,7 +232,6 @@ class CallingTools:
             "decision": buyer_response.decision.value,
             "reason": buyer_response.reason,
             "dialogue": buyer_response.dialogue,
-            "seller_pitch": pitch,  # What the seller said
             "offer_presented": offer.to_dict(),
             "offers_so_far": len(session.offers_presented),
         }
