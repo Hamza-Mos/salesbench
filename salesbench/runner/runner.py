@@ -9,12 +9,14 @@ import json
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from salesbench.runner.config import BenchmarkConfig, RunMode
 from salesbench.runner.executor import EpisodeExecutor
 from salesbench.runner.integrations import IntegrationManager
 from salesbench.runner.results import BenchmarkResult, EpisodeResult
+from salesbench.storage.json_writer import JSONResultsWriter
 
 logger = logging.getLogger(__name__)
 
@@ -36,16 +38,19 @@ class BenchmarkRunner:
         self,
         config: BenchmarkConfig,
         output_callback: Optional[Callable[[str], None]] = None,
+        results_dir: str = "results",
     ):
         """Initialize the benchmark runner.
 
         Args:
             config: Benchmark configuration.
             output_callback: Optional callback for progress output.
+            results_dir: Directory for JSON result files.
         """
         self.config = config
         self.output_callback = output_callback or (lambda x: print(x))
         self.integrations = IntegrationManager(config)
+        self.json_writer = JSONResultsWriter(results_dir) if config.enable_json_storage else None
 
     def run(self) -> BenchmarkResult:
         """Run the complete benchmark.
@@ -76,15 +81,29 @@ class BenchmarkRunner:
         self.integrations.start()
 
         try:
-            # Create agents
-            seller_agent, buyer_simulator, display_seller, display_buyer = self._create_agents()
+            # Create seller config and buyer simulator
+            result_tuple = self._create_agents()
+            (
+                seller_config,
+                buyer_simulator,
+                display_seller,
+                display_buyer,
+                seller_spec,
+                buyer_spec,
+            ) = result_tuple
 
-            if seller_agent is None:
+            if seller_config is None:
                 self.output_callback("ERROR: Failed to create agents")
                 return result
 
             self.output_callback(f"Seller model: {display_seller}")
             self.output_callback(f"Buyer model: {display_buyer}")
+
+            # Log context window info if available
+            if seller_spec and seller_spec.config:
+                trigger = seller_spec.config.compression_trigger
+                self.output_callback(f"Seller context threshold: {trigger:,} tokens")
+
             self.output_callback(
                 f"Supabase: {'enabled' if self.integrations.supabase_enabled else 'disabled'}"
             )
@@ -94,10 +113,12 @@ class BenchmarkRunner:
             self.output_callback("")
             self.output_callback("Running episodes...")
 
-            # Run episodes with parallelism
+            # Run episodes with parallelism (agents created per-episode)
             episode_results = await self._run_all_episodes(
-                seller_agent=seller_agent,
+                seller_config=seller_config,
                 buyer_simulator=buyer_simulator,
+                seller_model_spec=seller_spec,
+                buyer_model_spec=buyer_spec,
             )
 
             # Collect results
@@ -124,22 +145,40 @@ class BenchmarkRunner:
         # Print results
         self._print_results(result)
 
-        # Export if configured
-        if self.config.output_path:
-            self._export_results(result)
+        # Write to JSON storage
+        if self.json_writer and self.config.enable_json_storage:
+            # Extract custom name from output_path if provided (e.g., -o my_run)
+            custom_name = None
+            if self.config.output_path:
+                custom_name = Path(self.config.output_path).stem
+
+            results_dir = self.json_writer.write_benchmark(
+                self.config.benchmark_id,
+                result.to_dict(),
+                include_traces=self.config.verbose,
+                custom_name=custom_name,
+            )
+            self.output_callback(f"\nResults saved to: {results_dir}/")
+            self.output_callback("  - summary.json (metrics, config, episode results)")
+            if self.config.verbose:
+                self.output_callback("  - traces.json (full conversation trajectories)")
 
         return result
 
     async def _run_all_episodes(
         self,
-        seller_agent: Any,
+        seller_config: dict,
         buyer_simulator: Callable,
+        seller_model_spec=None,
+        buyer_model_spec=None,
     ) -> list[EpisodeResult]:
         """Run all episodes with controlled parallelism.
 
         Args:
-            seller_agent: The seller agent.
+            seller_config: Config dict to create seller agents (provider, model).
             buyer_simulator: The buyer simulator.
+            seller_model_spec: Model specification for seller.
+            buyer_model_spec: Model specification for buyer.
 
         Returns:
             List of episode results.
@@ -151,8 +190,10 @@ class BenchmarkRunner:
             async with semaphore:
                 return await self._run_single_episode(
                     episode_index=episode_index,
-                    seller_agent=seller_agent,
+                    seller_config=seller_config,
                     buyer_simulator=buyer_simulator,
+                    seller_model_spec=seller_model_spec,
+                    buyer_model_spec=buyer_model_spec,
                 )
 
         # Create tasks for all episodes
@@ -180,21 +221,38 @@ class BenchmarkRunner:
     async def _run_single_episode(
         self,
         episode_index: int,
-        seller_agent: Any,
+        seller_config: dict,
         buyer_simulator: Callable,
+        seller_model_spec=None,
+        buyer_model_spec=None,
     ) -> EpisodeResult:
         """Run a single episode asynchronously.
 
         Args:
             episode_index: Zero-based episode index.
-            seller_agent: The seller agent.
+            seller_config: Config dict to create seller agent.
             buyer_simulator: The buyer simulator.
+            seller_model_spec: Model specification for seller.
+            buyer_model_spec: Model specification for buyer.
 
         Returns:
             Episode result.
         """
+        from salesbench.agents.seller_llm import LLMSellerAgent
+
         seed = self.config.get_episode_seed(episode_index)
-        executor = EpisodeExecutor(self.config, self.integrations)
+        executor = EpisodeExecutor(
+            self.config,
+            self.integrations,
+            seller_model_spec=seller_model_spec,
+            buyer_model_spec=buyer_model_spec,
+        )
+
+        # Create a fresh agent for this episode (avoid state sharing in parallel runs)
+        seller_agent = LLMSellerAgent(
+            provider=seller_config["provider"],
+            model=seller_config["model"],
+        )
 
         # Run in executor to not block event loop
         loop = asyncio.get_event_loop()
@@ -209,53 +267,90 @@ class BenchmarkRunner:
         )
 
     def _create_agents(self):
-        """Create seller agent and buyer simulator.
+        """Create seller config and buyer simulator.
+
+        Parses model specs in provider/model format (e.g., "openai/gpt-4o")
+        and routes to the correct API based on the provider.
 
         Returns:
-            Tuple of (seller_agent, buyer_simulator, display_seller_name, display_buyer_name).
+            Tuple of (seller_config, buyer_simulator, display_seller_name, display_buyer_name,
+                      seller_model_spec, buyer_model_spec).
+            seller_config is a dict with provider/model to create agents per-episode.
         """
         import os
 
-        from salesbench.llm import DEFAULT_MODELS, detect_available_provider
-
-        provider = detect_available_provider()
-        if not provider:
-            self.output_callback("ERROR: No LLM provider API key found.")
-            self.output_callback("Set ONE of these environment variables:")
-            self.output_callback("  - OPENAI_API_KEY")
-            self.output_callback("  - ANTHROPIC_API_KEY")
-            self.output_callback("  - OPENROUTER_API_KEY")
-            return None, None, None, None
-
         from salesbench.agents.buyer_llm import create_buyer_simulator
-        from salesbench.agents.seller_llm import LLMSellerAgent
+        from salesbench.llm import get_api_key_for_provider
+        from salesbench.models import DEFAULT_BUYER_MODEL, parse_model_spec
 
-        # Determine models
-        seller_model = self.config.seller_model or os.environ.get("SALESBENCH_SELLER_MODEL")
-        buyer_model = self.config.buyer_model or os.environ.get("SALESBENCH_BUYER_MODEL")
-        buyer_temp = float(os.environ.get("SALESBENCH_BUYER_TEMPERATURE", "0.3"))
+        # Parse seller model (e.g., "openai/gpt-4o" -> provider="openai", model="gpt-4o")
+        seller_model_str = self.config.seller_model or os.environ.get("SALESBENCH_SELLER_MODEL")
+        if not seller_model_str:
+            self.output_callback("ERROR: No seller model specified.")
+            self.output_callback("Use --models provider/model (e.g., --models openai/gpt-4o)")
+            return None, None, None, None, None, None
 
-        # Create agents
+        try:
+            seller_spec = parse_model_spec(seller_model_str)
+        except ValueError as e:
+            self.output_callback(f"ERROR: {e}")
+            return None, None, None, None, None, None
+
+        # Parse buyer model
+        buyer_model_str = (
+            self.config.buyer_model
+            or os.environ.get("SALESBENCH_BUYER_MODEL")
+            or DEFAULT_BUYER_MODEL
+        )
+        try:
+            buyer_spec = parse_model_spec(buyer_model_str)
+        except ValueError as e:
+            self.output_callback(f"ERROR: {e}")
+            return None, None, None, None, None, None
+
+        # Check API keys for both providers
+        seller_api_key = get_api_key_for_provider(seller_spec.provider)
+        if not seller_api_key:
+            self.output_callback(
+                f"ERROR: No API key found for seller provider '{seller_spec.provider}'."
+            )
+            self.output_callback(
+                f"Set the appropriate environment variable for {seller_spec.provider}."
+            )
+            return None, None, None, None, None, None
+
+        buyer_api_key = get_api_key_for_provider(buyer_spec.provider)
+        if not buyer_api_key:
+            self.output_callback(
+                f"ERROR: No API key found for buyer provider '{buyer_spec.provider}'."
+            )
+            self.output_callback(
+                f"Set the appropriate environment variable for {buyer_spec.provider}."
+            )
+            return None, None, None, None, None, None
+
+        buyer_temp = float(os.environ.get("SALESBENCH_BUYER_TEMPERATURE", "0.0"))
+
+        # Create buyer simulator (stateless, safe to share)
         buyer_simulator = create_buyer_simulator(
-            provider=provider,
-            model=buyer_model,
+            provider=buyer_spec.provider,
+            model=buyer_spec.model,
             temperature=buyer_temp,
         )
 
-        seller_agent = LLMSellerAgent(
-            provider=provider,
-            model=seller_model,
-        )
-
-        # Display names
-        display_seller = seller_model or DEFAULT_MODELS.get(provider, "default")
-        display_buyer = buyer_model or DEFAULT_MODELS.get(provider, "default")
+        # Return seller config (agents created per-episode to avoid state sharing)
+        seller_config = {
+            "provider": seller_spec.provider,
+            "model": seller_spec.model,
+        }
 
         return (
-            seller_agent,
+            seller_config,
             buyer_simulator,
-            f"{display_seller} ({provider})",
-            f"{display_buyer} ({provider})",
+            str(seller_spec),
+            str(buyer_spec),
+            seller_spec,
+            buyer_spec,
         )
 
     def _print_header(self) -> None:
@@ -264,8 +359,10 @@ class BenchmarkRunner:
         self.output_callback("SalesBench Benchmark Runner")
         self.output_callback("=" * 40)
         self.output_callback(f"Mode: {self.config.mode.value}")
+        self.output_callback(f"Domain: {self.config.domain}")
         self.output_callback(f"Episodes: {self.config.num_episodes}")
         self.output_callback(f"Leads per episode: {self.config.num_leads}")
+        self.output_callback(f"Max turns per episode: {self.config.max_turns}")
         self.output_callback(f"Parallelism: {self.config.parallelism}")
         self.output_callback(f"Benchmark ID: {self.config.benchmark_id}")
 
@@ -306,6 +403,21 @@ class BenchmarkRunner:
             total_duration = metrics.get("total_duration_seconds", result.duration_seconds)
             self.output_callback(f"Total duration:     {total_duration:.1f}s")
 
+            # Token usage
+            token_usage = metrics.get("total_token_usage", {})
+            if token_usage:
+                self.output_callback("")
+                self.output_callback("Token Usage (all episodes):")
+                seller_in = token_usage.get("seller_input_tokens", 0)
+                seller_out = token_usage.get("seller_output_tokens", 0)
+                buyer_in = token_usage.get("buyer_input_tokens", 0)
+                buyer_out = token_usage.get("buyer_output_tokens", 0)
+                self.output_callback(f"  Seller: {seller_in:,} input, {seller_out:,} output")
+                self.output_callback(f"  Buyer:  {buyer_in:,} input, {buyer_out:,} output")
+                self.output_callback(
+                    f"  Total:  {seller_in + buyer_in:,} input, {seller_out + buyer_out:,} output"
+                )
+
         self.output_callback("")
 
         # Supabase info
@@ -318,18 +430,6 @@ class BenchmarkRunner:
         trace_url = self.integrations.get_grafana_trace_url(self.config.benchmark_id)
         if trace_url:
             self.output_callback(f"Traces: {trace_url}")
-
-    def _export_results(self, result: BenchmarkResult) -> None:
-        """Export results to JSON file."""
-        if not self.config.output_path:
-            return
-
-        try:
-            with open(self.config.output_path, "w") as f:
-                json.dump(result.to_dict(), f, indent=2)
-            self.output_callback(f"Results exported to: {self.config.output_path}")
-        except Exception as e:
-            self.output_callback(f"Failed to export results: {e}")
 
     def _verbose_callback(self, message: str) -> None:
         """Callback for verbose output from episode executor."""

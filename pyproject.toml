@@ -44,6 +44,9 @@ telemetry = [
 storage = [
     "supabase>=2.0.0",
 ]
+ui = [
+    "gradio>=4.0.0",
+]
 server = [
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
@@ -57,7 +60,7 @@ dev = [
     "pre-commit>=3.0.0",
 ]
 all = [
-    "salesbench[llm,telemetry,storage,server,dev]",
+    "salesbench[llm,telemetry,storage,ui,server,dev]",
 ]
 
 [project.scripts]

@@ -18,17 +18,20 @@ class RunMode(str, Enum):
 
 
 # Default presets for each mode
+# Note: parallelism defaults to 1 for simplicity and reproducibility.
+# Users can increase with --parallelism flag based on their API limits.
+# (Following tau-bench pattern: https://github.com/sierra-research/tau-bench)
 MODE_PRESETS = {
     RunMode.PRODUCTION: {
         "num_episodes": 100,
         "num_leads": 100,
         "max_turns": 200,
-        "parallelism": 5,
+        "parallelism": 1,
     },
     RunMode.TEST: {
         "num_episodes": 3,
         "num_leads": 5,
-        "max_turns": 30,
+        "max_turns": 100,
         "parallelism": 1,
     },
     RunMode.DEBUG: {
@@ -58,11 +61,13 @@ class BenchmarkConfig:
         num_leads: Number of leads per episode.
         max_turns: Maximum turns per episode.
         parallelism: Number of concurrent episodes.
-        seller_model: Model to use for the seller agent.
-        buyer_model: Model to use for the buyer simulator.
+        seller_model: Model for seller agent (format: provider/model).
+        buyer_model: Model for buyer simulator (format: provider/model).
         mode: Run mode (production, test, debug).
+        domain: Sales domain to benchmark (e.g., "insurance").
         enable_supabase: Whether to write to Supabase.
         enable_telemetry: Whether to send to OTel/Grafana.
+        enable_json_storage: Whether to write results to JSON files.
         output_path: Optional path for JSON output.
         verbose: Enable verbose output.
     """
@@ -73,12 +78,14 @@ class BenchmarkConfig:
     base_seed: int = 42
     num_leads: int = 100
     max_turns: int = 200
-    parallelism: int = 5
-    seller_model: Optional[str] = None
-    buyer_model: Optional[str] = None
+    parallelism: int = 1
+    seller_model: Optional[str] = None  # Format: provider/model (e.g., "openai/gpt-4o")
+    buyer_model: Optional[str] = None  # Format: provider/model (e.g., "openai/gpt-4o-mini")
     mode: RunMode = RunMode.PRODUCTION
+    domain: str = "insurance"
     enable_supabase: bool = True
-    enable_telemetry: bool = True
+    enable_telemetry: bool = False  # Disabled by default (requires OTEL collector)
+    enable_json_storage: bool = True
     output_path: Optional[str] = None
     verbose: bool = False
 
@@ -98,8 +105,10 @@ class BenchmarkConfig:
         base_seed: int = 42,
         seller_model: Optional[str] = None,
         buyer_model: Optional[str] = None,
+        domain: str = "insurance",
         enable_supabase: bool = True,
         enable_telemetry: bool = True,
+        enable_json_storage: bool = True,
         output_path: Optional[str] = None,
         verbose: bool = False,
         # Override presets
@@ -108,27 +117,7 @@ class BenchmarkConfig:
         max_turns: Optional[int] = None,
         parallelism: Optional[int] = None,
     ) -> "BenchmarkConfig":
-        """Create a config from a run mode with optional overrides.
-
-        Args:
-            mode: The run mode to use as base.
-            benchmark_id: Optional custom benchmark ID.
-            name: Name for the benchmark run.
-            base_seed: Starting seed for reproducibility.
-            seller_model: Model for seller agent.
-            buyer_model: Model for buyer simulator.
-            enable_supabase: Whether to write to Supabase.
-            enable_telemetry: Whether to send telemetry.
-            output_path: Path for JSON output.
-            verbose: Enable verbose output.
-            num_episodes: Override preset episode count.
-            num_leads: Override preset lead count.
-            max_turns: Override preset max turns.
-            parallelism: Override preset parallelism.
-
-        Returns:
-            Configured BenchmarkConfig.
-        """
+        """Create a config from a run mode with optional overrides."""
         presets = MODE_PRESETS[mode]
 
         return cls(
@@ -142,8 +131,10 @@ class BenchmarkConfig:
             seller_model=seller_model,
             buyer_model=buyer_model,
             mode=mode,
+            domain=domain,
             enable_supabase=enable_supabase,
             enable_telemetry=enable_telemetry,
+            enable_json_storage=enable_json_storage,
             output_path=output_path,
             verbose=verbose,
         )
@@ -159,32 +150,14 @@ class BenchmarkConfig:
         parallelism: Optional[int] = None,
         seller_model: Optional[str] = None,
         buyer_model: Optional[str] = None,
+        domain: str = "insurance",
         no_supabase: bool = False,
-        no_telemetry: bool = False,
+        enable_telemetry: bool = False,
         output: Optional[str] = None,
         verbose: bool = False,
         name: str = "",
     ) -> "BenchmarkConfig":
-        """Create config from CLI arguments.
-
-        Args:
-            mode: Run mode string.
-            episodes: Number of episodes.
-            seed: Base random seed.
-            leads: Leads per episode.
-            max_turns: Max turns per episode.
-            parallelism: Concurrent episodes.
-            seller_model: Seller model name.
-            buyer_model: Buyer model name.
-            no_supabase: Disable Supabase.
-            no_telemetry: Disable telemetry.
-            output: Output file path.
-            verbose: Verbose output.
-            name: Benchmark name.
-
-        Returns:
-            Configured BenchmarkConfig.
-        """
+        """Create config from CLI arguments."""
         run_mode = RunMode(mode)
 
         return cls.from_mode(
@@ -193,8 +166,9 @@ class BenchmarkConfig:
             base_seed=seed,
             seller_model=seller_model,
             buyer_model=buyer_model,
+            domain=domain,
             enable_supabase=not no_supabase,
-            enable_telemetry=not no_telemetry,
+            enable_telemetry=enable_telemetry,
             output_path=output,
             verbose=verbose,
             num_episodes=episodes,
@@ -227,8 +201,10 @@ class BenchmarkConfig:
             "seller_model": self.seller_model,
             "buyer_model": self.buyer_model,
             "mode": self.mode.value,
+            "domain": self.domain,
             "enable_supabase": self.enable_supabase,
             "enable_telemetry": self.enable_telemetry,
+            "enable_json_storage": self.enable_json_storage,
             "output_path": self.output_path,
             "verbose": self.verbose,
         }

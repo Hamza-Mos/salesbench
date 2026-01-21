@@ -10,16 +10,19 @@ Supports multiple LLM providers via the modular adapter:
 """
 
 import json
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from salesbench.agents.seller_base import (
     SellerAgent,
     SellerConfig,
     SellerObservation,
 )
-from salesbench.core.protocol import get_all_tool_schemas
+from salesbench.core.protocol import SellerAction, get_all_tool_schemas
 from salesbench.core.types import ToolCall
 from salesbench.llm import LLMClient, create_client, detect_available_provider
+
+if TYPE_CHECKING:
+    from salesbench.context.episode import EpisodeContext
 
 SELLER_SYSTEM_PROMPT = """You are an AI insurance sales agent. Your goal is to sell insurance plans to leads.
 
@@ -175,6 +178,8 @@ class LLMSellerAgent(SellerAgent):
         self._available_leads: list[dict] = []  # Track leads found but not yet called
         self._called_lead_ids: set[str] = set()  # Track which leads we've called
         self._accepted_lead_ids: set[str] = set()  # Track leads who accepted (don't call again)
+        self._exhausted_temps: set[str] = set()  # Temperature tiers that returned 0 leads
+        self._last_search_temp: Optional[str] = None  # Last temperature searched
 
     def _get_client(self) -> LLMClient:
         """Get or create the LLM client."""
@@ -190,17 +195,29 @@ class LLMSellerAgent(SellerAgent):
         """Reset agent state for new episode."""
         self._total_api_cost = 0.0
         self._turn_count = 0
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
         self._conversation_history = []
         self._available_leads = []
         self._called_lead_ids = set()
         self._accepted_lead_ids = set()
+        self._exhausted_temps = set()
+        self._last_search_temp = None
 
-    def act(self, observation: SellerObservation, tools: Optional[list] = None) -> SellerAction:
+    def act(
+        self,
+        observation: SellerObservation,
+        tools: Optional[list] = None,
+        episode_context: Optional["EpisodeContext"] = None,
+    ) -> SellerAction:
         """Decide what to say and which tools to call using LLM.
 
         Args:
             observation: Current observation from environment.
             tools: Optional tool schemas (uses built-in if not provided).
+            episode_context: Optional episode context for conversation history.
+                            If provided, uses compressed episode history instead
+                            of internal sliding window.
 
         Returns:
             SellerAction containing message and/or tool calls.
@@ -208,7 +225,7 @@ class LLMSellerAgent(SellerAgent):
         # Build user message from observation (also updates lead tracking)
         user_message = self._build_user_message(observation)
 
-        # Add to conversation history
+        # Add to conversation history (for fallback when no episode_context)
         self._conversation_history.append(
             {
                 "role": "user",
@@ -217,7 +234,7 @@ class LLMSellerAgent(SellerAgent):
         )
 
         # Get LLM response (returns message and tool_calls)
-        message, tool_calls = self._call_llm(user_message)
+        message, tool_calls = self._call_llm(user_message, episode_context)
 
         # HARD CONSTRAINT: Intercept redundant search_leads when we have uncalled leads
         # This prevents models from looping on search forever
@@ -228,20 +245,44 @@ class LLMSellerAgent(SellerAgent):
             and lead.get("lead_id") not in self._accepted_lead_ids
         ]
 
-        if uncalled_leads and not observation.in_call:
-            # Check if the model is trying to search again when it has leads
+        if not observation.in_call:
             corrected_calls = []
             for tc in tool_calls:
                 if tc.tool_name == "crm.search_leads":
-                    # Replace search with a call to the first available lead
-                    lead_id = uncalled_leads[0].get("lead_id", "")
-                    corrected_calls.append(
-                        ToolCall(
-                            tool_name="calling.start_call",
-                            arguments={"lead_id": lead_id},
-                            call_id=tc.call_id,
+                    if uncalled_leads:
+                        # Replace search with a call to the first available lead
+                        lead_id = uncalled_leads[0].get("lead_id", "")
+                        corrected_calls.append(
+                            ToolCall(
+                                tool_name="calling.start_call",
+                                arguments={"lead_id": lead_id},
+                                call_id=tc.call_id,
+                            )
                         )
-                    )
+                    else:
+                        # Check if searching exhausted temperature - redirect to next tier
+                        search_temp = tc.arguments.get("temperature", "hot")
+                        if search_temp in self._exhausted_temps:
+                            temp_order = ["hot", "warm", "lukewarm", "cold"]
+                            next_temp = None
+                            for temp in temp_order:
+                                if temp not in self._exhausted_temps:
+                                    next_temp = temp
+                                    break
+                            if next_temp:
+                                # Redirect to next available tier
+                                corrected_calls.append(
+                                    ToolCall(
+                                        tool_name="crm.search_leads",
+                                        arguments={**tc.arguments, "temperature": next_temp},
+                                        call_id=tc.call_id,
+                                    )
+                                )
+                            # else: all temps exhausted, let it fail naturally
+                            else:
+                                corrected_calls.append(tc)
+                        else:
+                            corrected_calls.append(tc)
                 else:
                     corrected_calls.append(tc)
             tool_calls = corrected_calls
@@ -249,11 +290,15 @@ class LLMSellerAgent(SellerAgent):
         # Add assistant response to history
         assistant_content = message or ""
         if tool_calls:
-            assistant_content += f"\n[Tool calls: {json.dumps([tc.to_dict() for tc in tool_calls])}]"
-        self._conversation_history.append({
-            "role": "assistant",
-            "content": assistant_content,
-        })
+            assistant_content += (
+                f"\n[Tool calls: {json.dumps([tc.to_dict() for tc in tool_calls])}]"
+            )
+        self._conversation_history.append(
+            {
+                "role": "assistant",
+                "content": assistant_content,
+            }
+        )
 
         self._turn_count += 1
         return SellerAction(tool_calls=tool_calls, message=message)
@@ -293,7 +338,11 @@ class LLMSellerAgent(SellerAgent):
                     # Special handling for search results - update available leads
                     if result.data and "leads" in result.data:
                         leads = result.data["leads"]
+                        searched_temp = result.data.get("filters_applied", {}).get("temperature")
                         if leads:
+                            # Found leads - clear this temp from exhausted
+                            if searched_temp:
+                                self._exhausted_temps.discard(searched_temp)
                             # Update available leads list (exclude already called AND accepted leads)
                             self._available_leads = [
                                 lead
@@ -319,7 +368,12 @@ class LLMSellerAgent(SellerAgent):
                                     f"  - {lead_id}: {name} ({temp}, ${income:,}/yr, {dependents} dependents, {risk} risk){status}"
                                 )
                         else:
-                            lines.append("✓ Search returned 0 leads for this filter.")
+                            # No leads found - mark this temperature as exhausted
+                            if searched_temp:
+                                self._exhausted_temps.add(searched_temp)
+                            lines.append(
+                                f"✓ Search returned 0 leads for '{searched_temp or 'this filter'}' - try next temperature tier."
+                            )
                     # Track when we start a call
                     elif result.data and result.data.get("call_started"):
                         lead_id = result.data.get("lead_id", "")
@@ -391,15 +445,42 @@ class LLMSellerAgent(SellerAgent):
             )
             lines.append("DO NOT SEARCH AGAIN. You already have leads to call.")
         else:
-            lines.append(
-                '## Next Action: Search for leads with `crm.search_leads(temperature="hot")`, then call them.'
-            )
+            # Show exhausted temps and suggest next tier
+            temp_order = ["hot", "warm", "lukewarm", "cold"]
+            next_temp = None
+            for temp in temp_order:
+                if temp not in self._exhausted_temps:
+                    next_temp = temp
+                    break
+
+            if self._exhausted_temps:
+                lines.append(
+                    f"## Exhausted temperature tiers: {', '.join(sorted(self._exhausted_temps))}"
+                )
+
+            if next_temp:
+                lines.append(
+                    f'## Next Action: Search for leads with `crm.search_leads(temperature="{next_temp}")`, then call them.'
+                )
+            else:
+                # All temperatures exhausted
+                lines.append(
+                    "## All lead temperature tiers have been searched. Episode should end."
+                )
 
         return "\n".join(lines)
 
-    def _call_llm(self, user_message: str) -> Tuple[Optional[str], list[ToolCall]]:
+    def _call_llm(
+        self,
+        user_message: str,
+        episode_context: Optional["EpisodeContext"] = None,
+    ) -> Tuple[Optional[str], list[ToolCall]]:
         """Call LLM API with function calling.
-        
+
+        Args:
+            user_message: The current user message (observation).
+            episode_context: Optional episode context for conversation history.
+
         Returns:
             Tuple of (message, tool_calls) where message is optional free-form text
             and tool_calls is a list of tool calls.
@@ -407,7 +488,17 @@ class LLMSellerAgent(SellerAgent):
         client = self._get_client()
 
         messages = [{"role": "system", "content": SELLER_SYSTEM_PROMPT}]
-        messages.extend(self._conversation_history[-10:])  # Keep recent history
+
+        # Use episode context if provided, otherwise fall back to sliding window
+        if episode_context is not None:
+            # Get compressed episode history from context
+            context_messages = episode_context.get_seller_view()
+            messages.extend(context_messages)
+            # Add the current observation as the latest message
+            messages.append({"role": "user", "content": user_message})
+        else:
+            # Fallback: use internal sliding window (last 20 messages)
+            messages.extend(self._conversation_history[-20:])
 
         # Use tool calling for OpenAI-compatible APIs
         if self.provider in ["openai", "openrouter", "xai", "together"]:
@@ -418,9 +509,11 @@ class LLMSellerAgent(SellerAgent):
             # Fallback to JSON-based tool calling
             return self._call_with_json(client, messages)
 
-    def _call_with_tools(self, client: LLMClient, messages: list) -> Tuple[Optional[str], list[ToolCall]]:
+    def _call_with_tools(
+        self, client: LLMClient, messages: list
+    ) -> Tuple[Optional[str], list[ToolCall]]:
         """Call using OpenAI-style tool calling.
-        
+
         Returns:
             Tuple of (message, tool_calls).
         """
@@ -466,7 +559,7 @@ class LLMSellerAgent(SellerAgent):
         # Parse message and tool calls from response
         tool_calls = []
         response_message = response.choices[0].message
-        
+
         # Get the text content (message to buyer)
         text_content = response_message.content
 
@@ -490,9 +583,11 @@ class LLMSellerAgent(SellerAgent):
 
         return text_content, tool_calls
 
-    def _call_anthropic(self, client: LLMClient, messages: list) -> Tuple[Optional[str], list[ToolCall]]:
+    def _call_anthropic(
+        self, client: LLMClient, messages: list
+    ) -> Tuple[Optional[str], list[ToolCall]]:
         """Call Anthropic API with tool use.
-        
+
         Returns:
             Tuple of (message, tool_calls).
         """
@@ -539,11 +634,13 @@ class LLMSellerAgent(SellerAgent):
             if content.type == "text":
                 text_content = content.text
             elif content.type == "tool_use":
-                tool_calls.append(ToolCall(
-                    tool_name=_from_api_name(content.name),
-                    arguments=content.input,
-                    call_id=content.id,
-                ))
+                tool_calls.append(
+                    ToolCall(
+                        tool_name=_from_api_name(content.name),
+                        arguments=content.input,
+                        call_id=content.id,
+                    )
+                )
 
         # If no output at all, use fallback
         if not tool_calls and not text_content:
@@ -551,9 +648,11 @@ class LLMSellerAgent(SellerAgent):
 
         return text_content, tool_calls
 
-    def _call_with_json(self, client: LLMClient, messages: list) -> Tuple[Optional[str], list[ToolCall]]:
+    def _call_with_json(
+        self, client: LLMClient, messages: list
+    ) -> Tuple[Optional[str], list[ToolCall]]:
         """Call using JSON-based tool calling (for providers without native tool support).
-        
+
         Returns:
             Tuple of (message, tool_calls).
         """
@@ -604,11 +703,17 @@ class LLMSellerAgent(SellerAgent):
                     arguments={"lead_id": lead_id},
                 )
             ]
-        # Otherwise, search for leads
+        # Otherwise, search for leads - use next available temperature tier
+        temp_order = ["hot", "warm", "lukewarm", "cold"]
+        next_temp = "hot"
+        for temp in temp_order:
+            if temp not in self._exhausted_temps:
+                next_temp = temp
+                break
         return [
             ToolCall(
                 tool_name="crm.search_leads",
-                arguments={"temperature": "hot", "limit": 10},
+                arguments={"temperature": next_temp, "limit": 10},
             )
         ]
 
@@ -636,9 +741,11 @@ class StreamingLLMSellerAgent(LLMSellerAgent):
         super().__init__(config, provider, model, api_key)
         self.on_token = on_token or (lambda x: None)
 
-    def _call_with_tools(self, client: LLMClient, messages: list) -> Tuple[Optional[str], list[ToolCall]]:
+    def _call_with_tools(
+        self, client: LLMClient, messages: list
+    ) -> Tuple[Optional[str], list[ToolCall]]:
         """Call with streaming for OpenAI-compatible APIs.
-        
+
         Returns:
             Tuple of (message, tool_calls).
         """
@@ -673,15 +780,15 @@ class StreamingLLMSellerAgent(LLMSellerAgent):
         # Collect streamed content
         tool_calls_data = {}
         text_content = ""
-        
+
         for chunk in stream:
             delta = chunk.choices[0].delta
-            
+
             # Collect text content
             if delta.content:
                 text_content += delta.content
                 self.on_token(delta.content)
-            
+
             # Collect tool calls
             if delta.tool_calls:
                 for tc in delta.tool_calls:
@@ -750,16 +857,31 @@ Format your response as:
 """
         return base_message + react_prompt
 
-    def _call_llm(self, user_message: str) -> Tuple[Optional[str], list[ToolCall]]:
+    def _call_llm(
+        self,
+        user_message: str,
+        episode_context: Optional["EpisodeContext"] = None,
+    ) -> Tuple[Optional[str], list[ToolCall]]:
         """Call LLM with ReAct-style prompting.
-        
+
+        Args:
+            user_message: The current user message (observation).
+            episode_context: Optional episode context for conversation history.
+
         Returns:
             Tuple of (message, tool_calls).
         """
         client = self._get_client()
 
         messages = [{"role": "system", "content": SELLER_SYSTEM_PROMPT}]
-        messages.extend(self._conversation_history[-10:])
+
+        # Use episode context if provided, otherwise fall back to sliding window
+        if episode_context is not None:
+            context_messages = episode_context.get_seller_view()
+            messages.extend(context_messages)
+            messages.append({"role": "user", "content": user_message})
+        else:
+            messages.extend(self._conversation_history[-20:])
 
         response = client.complete(
             messages=messages,

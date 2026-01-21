@@ -25,8 +25,11 @@ from salesbench.envs.sales_mvp.personas import Persona
 from salesbench.llm import LLMClient, create_client, detect_available_provider
 
 # Type alias for the buyer simulator function
-# Args: persona, offer, session, seller_pitch (optional)
-BuyerSimulatorFn = Callable[[Persona, PlanOffer, CallSession, Optional[str]], BuyerResponseData]
+# Args: persona, offer, session, seller_pitch (optional), negotiation_history (optional)
+BuyerSimulatorFn = Callable[
+    [Persona, PlanOffer, CallSession, Optional[str], Optional[str]],
+    BuyerResponseData,
+]
 
 
 BUYER_SYSTEM_PROMPT = """You are simulating a potential insurance buyer in a cold-call scenario.
@@ -77,6 +80,7 @@ def create_buyer_prompt(
     offer: PlanOffer,
     session: CallSession,
     seller_pitch: Optional[str] = None,
+    negotiation_history: Optional[str] = None,
 ) -> str:
     """Create the prompt for the buyer LLM.
 
@@ -85,6 +89,7 @@ def create_buyer_prompt(
         offer: The plan being offered.
         session: Current call session.
         seller_pitch: What the salesperson said when presenting the offer.
+        negotiation_history: Optional history of previous conversations with this seller.
 
     Returns:
         Formatted prompt string.
@@ -134,7 +139,20 @@ This offer is {"AFFORDABLE" if is_affordable else "NOT AFFORDABLE"} for you.
 (Premium ${offer.monthly_premium:.2f} vs your max ${max_affordable:.2f})
 
 ## What the Salesperson Said
-{seller_pitch if seller_pitch else "(The salesperson presented the offer without additional commentary.)"}
+{seller_pitch if seller_pitch else "(The salesperson presented the offer without additional commentary.)"}"""
+
+    # Add negotiation history if available
+    if negotiation_history and negotiation_history.strip():
+        prompt += f"""
+
+## Your Previous Interactions With This Seller
+{negotiation_history}
+
+IMPORTANT: Be consistent with objections you've raised before. Remember offers you've rejected and why.
+If you previously rejected a similar offer, don't suddenly accept unless the terms have significantly improved.
+If you expressed specific concerns before, those concerns should still matter to you."""
+
+    prompt += """
 
 Based on all this information, what is your decision?
 Remember to respond with ONLY the JSON object."""
@@ -169,6 +187,23 @@ class LLMBuyerSimulator:
         self._api_key = api_key
         self._client: Optional[LLMClient] = None
 
+        # Token tracking
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+
+    def reset(self) -> None:
+        """Reset token tracking for new episode."""
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+
+    def get_token_usage(self) -> tuple[int, int]:
+        """Get total token usage for this episode.
+
+        Returns:
+            Tuple of (input_tokens, output_tokens).
+        """
+        return self._total_input_tokens, self._total_output_tokens
+
     def _get_client(self) -> LLMClient:
         """Get or create the LLM client."""
         if self._client is None:
@@ -185,6 +220,7 @@ class LLMBuyerSimulator:
         offer: PlanOffer,
         session: CallSession,
         seller_pitch: Optional[str] = None,
+        negotiation_history: Optional[str] = None,
     ) -> BuyerResponseData:
         """Simulate buyer decision using LLM.
 
@@ -193,6 +229,7 @@ class LLMBuyerSimulator:
             offer: The plan being offered.
             session: Current call session.
             seller_pitch: What the salesperson said when presenting the offer.
+            negotiation_history: Optional history of previous conversations with this seller.
 
         Returns:
             BuyerResponseData with decision and reason.
@@ -200,7 +237,7 @@ class LLMBuyerSimulator:
         Raises:
             RuntimeError: If LLM call fails.
         """
-        prompt = create_buyer_prompt(persona, offer, session, seller_pitch)
+        prompt = create_buyer_prompt(persona, offer, session, seller_pitch, negotiation_history)
 
         try:
             client = self._get_client()
@@ -213,6 +250,11 @@ class LLMBuyerSimulator:
                 max_tokens=250,
                 response_format={"type": "json_object"},
             )
+
+            # Track token usage
+            if response.usage:
+                self._total_input_tokens += response.usage.get("prompt_tokens", 0)
+                self._total_output_tokens += response.usage.get("completion_tokens", 0)
 
             result = json.loads(response.content)
 

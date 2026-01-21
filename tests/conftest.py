@@ -71,7 +71,7 @@ def orchestrator(default_config: SalesBenchConfig) -> Orchestrator:
 def mock_buyer_simulator():
     """Create a mock buyer simulator that always rejects."""
 
-    def simulator(lead, offer, session, pitch=None):
+    def simulator(lead, offer, session, pitch=None, negotiation_history=None):
         from salesbench.core.types import BuyerResponseData
 
         return BuyerResponseData(
@@ -87,7 +87,7 @@ def mock_buyer_simulator():
 def accepting_buyer_simulator():
     """Create a mock buyer simulator that always accepts."""
 
-    def simulator(lead, offer, session, pitch=None):
+    def simulator(lead, offer, session, pitch=None, negotiation_history=None):
         from salesbench.core.types import BuyerResponseData
 
         return BuyerResponseData(

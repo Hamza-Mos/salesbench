@@ -1,8 +1,11 @@
 """Storage layer for SalesBench.
 
-Optional outer-layer integration for Supabase batch writes.
+Provides multiple storage backends:
+- JSONResultsWriter: Simple JSON file storage (default)
+- SupabaseWriter: Optional cloud database integration
 """
 
+from salesbench.storage.json_writer import JSONResultsWriter
 from salesbench.storage.supabase_writer import (
     BatchWriter,
     SupabaseConfig,
@@ -10,6 +13,7 @@ from salesbench.storage.supabase_writer import (
 )
 
 __all__ = [
+    "JSONResultsWriter",
     "SupabaseWriter",
     "SupabaseConfig",
     "BatchWriter",
