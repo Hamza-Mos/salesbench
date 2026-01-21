@@ -292,6 +292,12 @@ class BenchmarkRunner:
             model=seller_config["model"],
         )
 
+        # Create episode-specific verbose callback with episode prefix
+        def episode_verbose_callback(message: str) -> None:
+            if self._verbose_callback:
+                prefix = f"[Ep {episode_index + 1}]"
+                self._verbose_callback(f"{prefix} {message}")
+
         # Run in executor to not block event loop
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
@@ -301,7 +307,7 @@ class BenchmarkRunner:
             seed,
             seller_agent,
             buyer_simulator,
-            self._verbose_callback if self.config.verbose else None,
+            episode_verbose_callback if self.config.verbose else None,
         )
 
     def _create_agents(self):
