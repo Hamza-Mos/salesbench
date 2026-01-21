@@ -213,6 +213,52 @@ def test_orchestrator_blocks_duplicate_search_consecutive_turns(default_config):
     assert "Duplicate crm.search_leads" in (r2.tool_results[0].error or "")
 
 
+def test_has_propose_plan_helper():
+    """Verify _has_propose_plan correctly detects calling.propose_plan tool calls."""
+    from salesbench.agents.seller_llm import _has_propose_plan
+    from salesbench.core.types import ToolCall
+
+    # Empty list
+    assert _has_propose_plan([]) is False
+
+    # No propose_plan
+    tool_calls_without = [
+        ToolCall(tool_name="crm.search_leads", arguments={"limit": 10}),
+        ToolCall(tool_name="calling.start_call", arguments={"lead_id": "abc"}),
+    ]
+    assert _has_propose_plan(tool_calls_without) is False
+
+    # Has propose_plan
+    tool_calls_with = [
+        ToolCall(tool_name="crm.search_leads", arguments={"limit": 10}),
+        ToolCall(
+            tool_name="calling.propose_plan",
+            arguments={
+                "plan_id": "TERM",
+                "monthly_premium": 50,
+                "coverage_amount": 100000,
+                "next_step": "close_now",
+                "term_years": 20,
+            },
+        ),
+    ]
+    assert _has_propose_plan(tool_calls_with) is True
+
+    # Only propose_plan
+    tool_calls_only = [
+        ToolCall(
+            tool_name="calling.propose_plan",
+            arguments={
+                "plan_id": "WHOLE",
+                "monthly_premium": 100,
+                "coverage_amount": 250000,
+                "next_step": "schedule_followup",
+            },
+        ),
+    ]
+    assert _has_propose_plan(tool_calls_only) is True
+
+
 def test_llm_seller_postprocess_dedupes_and_caps_propose_plan():
     """Regression: prevent LLM tool-call spam within a single action."""
     from salesbench.agents.seller_llm import _postprocess_tool_calls

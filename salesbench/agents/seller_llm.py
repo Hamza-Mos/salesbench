@@ -168,6 +168,11 @@ def _postprocess_tool_calls(tool_calls: list[ToolCall]) -> list[ToolCall]:
     return filtered
 
 
+def _has_propose_plan(tool_calls: list[ToolCall]) -> bool:
+    """Check if any tool call is calling.propose_plan."""
+    return any(tc.tool_name == "calling.propose_plan" for tc in tool_calls)
+
+
 TOOLS_FOR_LLM = [
     {
         "type": "function",
@@ -504,7 +509,14 @@ class LLMSellerAgent(SellerAgent):
         if not tool_calls and not text_content:
             return None, self._fallback_action()
 
-        return text_content, _postprocess_tool_calls(tool_calls)
+        # Post-process tool calls
+        filtered_tool_calls = _postprocess_tool_calls(tool_calls)
+
+        # GUARDRAIL: If propose_plan without message, re-prompt once
+        if _has_propose_plan(filtered_tool_calls) and not (text_content and text_content.strip()):
+            text_content = self._reprompt_for_message(client, messages, filtered_tool_calls)
+
+        return text_content, filtered_tool_calls
 
     def _call_anthropic(
         self, client: LLMClient, messages: list
@@ -569,7 +581,16 @@ class LLMSellerAgent(SellerAgent):
         if not tool_calls and not text_content:
             return None, self._fallback_action()
 
-        return text_content, _postprocess_tool_calls(tool_calls)
+        # Post-process tool calls
+        filtered_tool_calls = _postprocess_tool_calls(tool_calls)
+
+        # GUARDRAIL: If propose_plan without message, re-prompt once
+        if _has_propose_plan(filtered_tool_calls) and not (text_content and text_content.strip()):
+            text_content = self._reprompt_for_message_anthropic(
+                client, messages, filtered_tool_calls
+            )
+
+        return text_content, filtered_tool_calls
 
     def _call_with_json(
         self, client: LLMClient, messages: list
@@ -607,6 +628,157 @@ class LLMSellerAgent(SellerAgent):
             pass
 
         return None, self._fallback_action()
+
+    def _reprompt_for_message(
+        self,
+        client: LLMClient,
+        messages: list,
+        tool_calls: list[ToolCall],
+    ) -> Optional[str]:
+        """Re-prompt LLM to provide spoken message for propose_plan.
+
+        When the model calls propose_plan without any text content, we make
+        a second call (no tools) asking for just the spoken pitch.
+
+        Args:
+            client: The LLM client.
+            messages: Original conversation messages.
+            tool_calls: The tool calls that were made (includes propose_plan).
+
+        Returns:
+            The spoken message text, or None if still missing.
+        """
+        import openai
+
+        # Extract propose_plan details for context
+        propose_call = next(
+            (tc for tc in tool_calls if tc.tool_name == "calling.propose_plan"), None
+        )
+        if not propose_call:
+            return None
+
+        args = propose_call.arguments or {}
+        plan_id = args.get("plan_id", "insurance plan")
+        premium = args.get("monthly_premium", "")
+        coverage = args.get("coverage_amount", "")
+
+        # Build a focused re-prompt
+        reprompt_message = (
+            f"You just called propose_plan for {plan_id} "
+            f"(${premium}/month, ${coverage} coverage) but you didn't include "
+            "any spoken message to the buyer. The buyer cannot see tool calls - "
+            "they only hear what you say.\n\n"
+            "Please provide ONLY your spoken pitch (1-3 sentences) that presents "
+            "this offer to the buyer. Do not include any tool calls or explanations."
+        )
+
+        # Make a second call without tools
+        reprompt_messages = messages + [{"role": "user", "content": reprompt_message}]
+
+        if hasattr(client, "_client") and isinstance(client._client, openai.OpenAI):
+            raw_client = client._client
+        else:
+            raw_client = openai.OpenAI(
+                api_key=self._api_key,
+                base_url=getattr(client, "_base_url", None),
+            )
+
+        model_name = client.get_model_name()
+        uses_new_api = any(x in model_name for x in ["gpt-5", "gpt-4.1", "o1", "o3"])
+
+        api_params = {
+            "model": model_name,
+            "messages": reprompt_messages,
+            "temperature": self.config.temperature,
+        }
+
+        if uses_new_api:
+            api_params["max_completion_tokens"] = 256
+        else:
+            api_params["max_tokens"] = 256
+
+        response = raw_client.chat.completions.create(**api_params)
+
+        # Track cost
+        if response.usage:
+            self._track_cost(
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens,
+                client.get_model_name(),
+            )
+
+        text_content = response.choices[0].message.content
+        if text_content and text_content.strip():
+            return text_content.strip()
+        return None
+
+    def _reprompt_for_message_anthropic(
+        self,
+        client: LLMClient,
+        messages: list,
+        tool_calls: list[ToolCall],
+    ) -> Optional[str]:
+        """Re-prompt Anthropic LLM to provide spoken message for propose_plan.
+
+        Args:
+            client: The Anthropic client.
+            messages: Original conversation messages.
+            tool_calls: The tool calls that were made (includes propose_plan).
+
+        Returns:
+            The spoken message text, or None if still missing.
+        """
+        import anthropic
+
+        # Extract propose_plan details for context
+        propose_call = next(
+            (tc for tc in tool_calls if tc.tool_name == "calling.propose_plan"), None
+        )
+        if not propose_call:
+            return None
+
+        args = propose_call.arguments or {}
+        plan_id = args.get("plan_id", "insurance plan")
+        premium = args.get("monthly_premium", "")
+        coverage = args.get("coverage_amount", "")
+
+        reprompt_message = (
+            f"You just called propose_plan for {plan_id} "
+            f"(${premium}/month, ${coverage} coverage) but you didn't include "
+            "any spoken message to the buyer. The buyer cannot see tool calls - "
+            "they only hear what you say.\n\n"
+            "Please provide ONLY your spoken pitch (1-3 sentences) that presents "
+            "this offer to the buyer. Do not include any tool calls or explanations."
+        )
+
+        if hasattr(client, "_client") and isinstance(client._client, anthropic.Anthropic):
+            raw_client = client._client
+        else:
+            raw_client = anthropic.Anthropic(api_key=self._api_key)
+
+        # Filter out system message and add reprompt
+        chat_messages = [m for m in messages if m["role"] != "system"]
+        chat_messages.append({"role": "user", "content": reprompt_message})
+
+        response = raw_client.messages.create(
+            model=client.get_model_name(),
+            max_tokens=256,
+            system=SELLER_SYSTEM_PROMPT,
+            messages=chat_messages,
+        )
+
+        # Track cost
+        self._track_cost(
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+            client.get_model_name(),
+        )
+
+        # Extract text content
+        for content in response.content:
+            if content.type == "text" and content.text and content.text.strip():
+                return content.text.strip()
+        return None
 
     def _fallback_action(self) -> list[ToolCall]:
         """Raise error when LLM returns nothing - no silent fallbacks."""
@@ -718,7 +890,14 @@ class StreamingLLMSellerAgent(LLMSellerAgent):
         if not tool_calls and not text_content:
             return None, self._fallback_action()
 
-        return text_content or None, _postprocess_tool_calls(tool_calls)
+        # Post-process tool calls
+        filtered_tool_calls = _postprocess_tool_calls(tool_calls)
+
+        # GUARDRAIL: If propose_plan without message, re-prompt once
+        if _has_propose_plan(filtered_tool_calls) and not (text_content and text_content.strip()):
+            text_content = self._reprompt_for_message(client, messages, filtered_tool_calls)
+
+        return text_content or None, filtered_tool_calls
 
 
 class ReActSellerAgent(LLMSellerAgent):
