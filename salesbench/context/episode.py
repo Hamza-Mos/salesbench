@@ -83,6 +83,8 @@ class AnchoredState:
     active_call_lead_name: Optional[str] = None
     # Track searched temperatures to avoid redundant searches
     searched_temperatures: set[str] = field(default_factory=set)
+    # Protocol warnings (e.g., repeated propose_plan without message)
+    protocol_warnings: list[str] = field(default_factory=list)
 
     def record_search(self, filters: dict) -> None:
         """Record that a search was performed with given filters."""
@@ -134,12 +136,28 @@ class AnchoredState:
             if l.lead_id not in self.called_lead_ids and l.lead_id not in self.accepted_lead_ids
         ]
 
+    def add_protocol_warning(self, warning: str) -> None:
+        """Add a protocol warning (deduplicated)."""
+        if warning not in self.protocol_warnings:
+            self.protocol_warnings.append(warning)
+
+    def clear_protocol_warnings(self) -> None:
+        """Clear all protocol warnings."""
+        self.protocol_warnings.clear()
+
     def to_context_block(self) -> str:
         """Generate context block injected at start of every seller view.
 
         Shows facts clearly - no directive language. The model decides based on context.
         """
         lines = []
+
+        # PROTOCOL WARNINGS - always show at top (survives context compression)
+        if self.protocol_warnings:
+            lines.append("!!! PROTOCOL WARNINGS !!!")
+            for warning in self.protocol_warnings:
+                lines.append(f"  - {warning}")
+            lines.append("")
 
         # ACTIVE CALL STATUS - just the fact
         if self.active_call_lead_id:

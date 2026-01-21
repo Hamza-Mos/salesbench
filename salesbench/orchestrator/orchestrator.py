@@ -18,7 +18,11 @@ from salesbench.core.types import ToolCall, ToolResult
 from salesbench.envs.sales_mvp.env import SalesEnv
 from salesbench.models import ModelConfig, ModelSpec
 from salesbench.orchestrator.budgets import BudgetTracker
-from salesbench.orchestrator.termination import TerminationChecker, TerminationStatus
+from salesbench.orchestrator.termination import (
+    TerminationChecker,
+    TerminationReason,
+    TerminationStatus,
+)
 
 
 @dataclass
@@ -136,6 +140,7 @@ class Orchestrator:
         # Guardrails for benchmark-clean trajectories
         self._last_search_signature: Optional[tuple[tuple[str, Any], ...]] = None
         self._last_search_turn: int = 0
+        self._propose_without_message_count: int = 0
 
     @property
     def is_terminated(self) -> bool:
@@ -193,6 +198,7 @@ class Orchestrator:
         # Reset guardrails
         self._last_search_signature = None
         self._last_search_turn = 0
+        self._propose_without_message_count = 0
 
         return observation
 
@@ -229,12 +235,39 @@ class Orchestrator:
                 if tc.tool_name == "calling.propose_plan" and not (
                     seller_message and seller_message.strip()
                 ):
-                    tool_results.append(
-                        ToolResult(
-                            call_id=tc.call_id,
-                            success=False,
-                            error="Protocol violation: calling.propose_plan requires a seller message in the same turn.",
+                    self._propose_without_message_count += 1
+                    count = self._propose_without_message_count
+
+                    if count == 1:
+                        # First violation: clear, actionable guidance
+                        error_msg = (
+                            "Protocol violation: calling.propose_plan requires a seller message. "
+                            "You MUST output spoken text (your pitch) alongside the propose_plan tool call. "
+                            "The buyer hears your message, not the tool call - propose_plan is for analytics only."
                         )
+                    elif count < 5:
+                        # Repeated violations: escalate with countdown
+                        error_msg = (
+                            f"REPEATED VIOLATION ({count}/5): propose_plan requires spoken text! "
+                            f"Output your pitch as a message AND call propose_plan together. "
+                            f"Episode terminates after {5 - count} more violations."
+                        )
+                        # Inject warning into AnchoredState (always visible)
+                        self._episode_context._anchored_state.add_protocol_warning(
+                            f"propose_plan called {count}x without message - include your pitch as spoken text"
+                        )
+                    else:
+                        # 5th violation: terminate gracefully
+                        self._terminated = True
+                        self._termination_status = TerminationStatus(
+                            terminated=True,
+                            reason=TerminationReason.PROTOCOL_VIOLATION_LOOP,
+                            message="Episode terminated: repeated propose_plan calls without seller message",
+                        )
+                        error_msg = "TERMINATED: Too many protocol violations (propose_plan without message)."
+
+                    tool_results.append(
+                        ToolResult(call_id=tc.call_id, success=False, error=error_msg)
                     )
                     continue
 
@@ -286,6 +319,10 @@ class Orchestrator:
                 # Mark that we executed a proposal (even if rejected/accepted)
                 if tc.tool_name == "calling.propose_plan":
                     proposal_executed = True
+                    # Reset violation counter and clear warnings on successful proposal
+                    if result.success:
+                        self._propose_without_message_count = 0
+                        self._episode_context._anchored_state.clear_protocol_warnings()
 
                 # --- Guardrail: stop executing remaining tools after call ends ---
                 # Prevents noisy "No active call" errors from extra tool calls in same turn.

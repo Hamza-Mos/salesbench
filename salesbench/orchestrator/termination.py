@@ -25,6 +25,7 @@ class TerminationReason(str, Enum):
     AGENT_QUIT = "agent_quit"  # Agent chose to end
     MAX_TURNS = "max_turns"  # Maximum turns reached
     ERROR = "error"  # Unrecoverable error
+    PROTOCOL_VIOLATION_LOOP = "protocol_violation_loop"  # Repeated protocol violations
 
 
 @dataclass
