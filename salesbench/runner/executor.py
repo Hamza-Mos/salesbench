@@ -224,29 +224,84 @@ class EpisodeExecutor:
 
             # Extract tool calls from action
             tool_calls = action.tool_calls if action else []
+            seller_message = action.message if action else None
 
             # Record seller's message to episode context if present
-            if action and action.message:
-                orchestrator.record_seller_message(action.message)
+            if seller_message:
+                orchestrator.record_seller_message(seller_message)
 
-            if not tool_calls and not (action and action.message):
+            if not tool_calls and not seller_message:
                 if verbose_callback:
                     verbose_callback(f"  Turn {turn}: No action, ending")
                 break
 
-            # Execute step with tool calls
-            result = orchestrator.step(tool_calls) if tool_calls else None
+            # Execute step with tool calls (pass seller_message for history)
+            # Even if no tool calls, we call step to record the message in history
+            if tool_calls:
+                result = orchestrator.step(tool_calls, seller_message=seller_message)
+            elif seller_message:
+                # No tool calls but seller sent a message - still record it
+                result = orchestrator.step([], seller_message=seller_message)
+            else:
+                result = None
 
-            # Verbose output
+            # Check if a buyer decision was made (from propose_plan)
+            buyer_decision_made = False
+            if result:
+                for tr in result.tool_results:
+                    if tr.data and tr.data.get("decision"):
+                        buyer_decision_made = True
+                        break
+
+            # Get buyer conversational response if:
+            # - Seller sent a message
+            # - We're in a call
+            # - No decision was made via propose_plan (avoid double response)
+            buyer_conversation_response = None
+            if seller_message and orchestrator.is_in_call and not buyer_decision_made:
+                buyer_conversation_response = orchestrator.get_buyer_response(seller_message)
+                if buyer_conversation_response:
+                    # Record buyer's response to episode context
+                    lead_id = orchestrator.episode_context.current_lead_id
+                    if lead_id:
+                        orchestrator.episode_context.record_buyer_decision(
+                            lead_id=lead_id,
+                            decision="conversation",  # Not a real decision, just dialogue
+                            dialogue=buyer_conversation_response,
+                            reason="conversational response",
+                        )
+
+            # Verbose output with clear [SELLER] and [BUYER] labels
             if verbose_callback and self.config.verbose:
-                if action and action.message:
-                    verbose_callback(f"  💬 {action.message[:100]}...")
+                # Seller's spoken message (full, no truncation)
+                if seller_message:
+                    verbose_callback(f"  [SELLER] {seller_message}")
+
+                # Seller's tool calls
                 for tc in tool_calls:
-                    verbose_callback(f"  → {tc.tool_name}({tc.arguments})")
+                    verbose_callback(f"  [SELLER][TOOL] {tc.tool_name}({tc.arguments})")
+
+                # Tool results - check for buyer responses
                 if result:
                     for tr in result.tool_results:
                         status = "OK" if tr.success else "FAIL"
-                        verbose_callback(f"  ← [{status}] {tr.data or tr.error}")
+                        data = tr.data or {}
+
+                        # Check if this contains a buyer response (from propose_plan, etc.)
+                        if data.get("dialogue"):
+                            decision = data.get("decision", "response")
+                            dialogue = data.get("dialogue", "")
+                            verbose_callback(f"  [BUYER][{decision.upper()}] {dialogue}")
+                        elif data.get("decision"):
+                            # Decision without dialogue
+                            verbose_callback(f"  [BUYER][{data['decision'].upper()}]")
+                        else:
+                            # Regular tool result (full, no truncation)
+                            verbose_callback(f"  [TOOL][{status}] {tr.data or tr.error}")
+
+                # Show buyer conversational response (if not already shown via decision)
+                if buyer_conversation_response:
+                    verbose_callback(f"  [BUYER] {buyer_conversation_response}")
 
             if result and result.terminated:
                 break
@@ -255,6 +310,14 @@ class EpisodeExecutor:
             if result:
                 obs_dict = result.observation
                 obs_dict["last_tool_results"] = [tr.to_dict() for tr in result.tool_results]
+
+            # Add buyer conversational response to observation and history
+            if buyer_conversation_response:
+                obs_dict["buyer_response"] = buyer_conversation_response
+                # Also add as a system message so seller sees it
+                obs_dict["message"] = f'Buyer: "{buyer_conversation_response}"'
+                # Record in history for JSON output
+                orchestrator.record_buyer_conversation(buyer_conversation_response)
 
         return orchestrator.get_final_result()
 

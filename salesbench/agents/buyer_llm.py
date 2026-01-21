@@ -32,6 +32,29 @@ BuyerSimulatorFn = Callable[
 ]
 
 
+BUYER_CONVERSATION_PROMPT = """You are simulating a potential insurance buyer in a cold-call scenario.
+The salesperson has just said something to you. Respond naturally based on your persona.
+
+You are NOT making a decision about a plan yet - just having a conversation.
+Respond with what you would naturally say in this situation.
+
+Your response should be:
+- Natural and conversational (1-3 sentences)
+- Consistent with your persona's personality and interest level
+- May include questions, objections, interest signals, or small talk
+
+HOT leads: Engaged, ask good questions, show interest
+WARM leads: Curious but cautious, may have concerns
+LUKEWARM leads: Skeptical, need convincing, may be distracted
+COLD leads: Disinterested, short responses, may try to end call
+HOSTILE leads: Annoyed at being called, will be curt or rude
+
+Respond with ONLY a JSON object:
+{
+    "dialogue": "What you say to the salesperson (in first person, conversational)"
+}
+"""
+
 BUYER_SYSTEM_PROMPT = """You are simulating a potential insurance buyer in a cold-call scenario.
 You will receive information about your persona (who you are) and an insurance offer.
 
@@ -160,6 +183,62 @@ Remember to respond with ONLY the JSON object."""
     return prompt
 
 
+def create_conversation_prompt(
+    persona: Persona,
+    seller_message: str,
+    session: CallSession,
+    negotiation_history: Optional[str] = None,
+) -> str:
+    """Create the prompt for a conversational buyer response (not a decision).
+
+    Args:
+        persona: The buyer persona.
+        seller_message: What the salesperson just said.
+        session: Current call session.
+        negotiation_history: Optional history of previous conversations.
+
+    Returns:
+        Formatted prompt string.
+    """
+    prompt = f"""## Your Persona
+Name: {persona.name}
+Age: {persona.age}
+Job: {persona.job}
+Annual Income: ${persona.annual_income:,}
+Household: {persona.household_size} people ({persona.num_dependents} dependents)
+
+## Your Personality
+- Trust in insurance salespeople: {persona.hidden.trust:.0%}
+- Interest in buying insurance: {persona.hidden.interest:.0%}
+- Patience remaining: {persona.hidden.patience:.0%}
+- Objection style: {persona.objection_style.value}
+
+## Your Temperature
+You are a {persona.temperature.value.upper()} lead.
+
+## Life Situation
+{persona.trigger}
+
+## Call Context
+- Offers presented so far: {len(session.offers_presented)}
+- Call duration: {session.duration_minutes} minutes"""
+
+    if negotiation_history and negotiation_history.strip():
+        prompt += f"""
+
+## Conversation So Far
+{negotiation_history}"""
+
+    prompt += f"""
+
+## What the Salesperson Just Said
+"{seller_message}"
+
+How do you respond? Remember to respond with ONLY the JSON object."""
+
+    return prompt
+
+
 class LLMBuyerSimulator:
     """LLM-based buyer simulator with multi-provider support."""
 
@@ -270,6 +349,57 @@ class LLMBuyerSimulator:
             raise RuntimeError(f"LLM response missing required field: {e}")
         except Exception as e:
             raise RuntimeError(f"LLM buyer simulation failed: {e}")
+
+    def get_conversational_response(
+        self,
+        persona: Persona,
+        seller_message: str,
+        session: CallSession,
+        negotiation_history: Optional[str] = None,
+    ) -> str:
+        """Get a conversational response from the buyer (not a decision).
+
+        This is used when the seller speaks but doesn't make a proposal.
+        The buyer responds naturally based on their persona.
+
+        Args:
+            persona: The buyer persona.
+            seller_message: What the salesperson just said.
+            session: Current call session.
+            negotiation_history: Optional history of previous conversations.
+
+        Returns:
+            The buyer's dialogue response.
+        """
+        prompt = create_conversation_prompt(persona, seller_message, session, negotiation_history)
+
+        try:
+            client = self._get_client()
+            response = client.complete(
+                messages=[
+                    {"role": "system", "content": BUYER_CONVERSATION_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=self.temperature,
+                max_tokens=150,
+                response_format={"type": "json_object"},
+            )
+
+            # Track token usage
+            if response.usage:
+                self._total_input_tokens += response.usage.get("prompt_tokens", 0)
+                self._total_output_tokens += response.usage.get("completion_tokens", 0)
+
+            result = json.loads(response.content)
+            dialogue = result.get("dialogue")
+            if not dialogue:
+                raise RuntimeError("LLM response missing 'dialogue' field")
+            return dialogue
+
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Failed to parse LLM response as JSON: {e}")
+        except Exception as e:
+            raise RuntimeError(f"LLM buyer conversation failed: {e}")
 
 
 def create_buyer_simulator(

@@ -135,50 +135,39 @@ class AnchoredState:
         ]
 
     def to_context_block(self) -> str:
-        """Generate context block injected at start of every seller view."""
+        """Generate context block injected at start of every seller view.
+
+        Shows facts clearly - no directive language. The model decides based on context.
+        """
         lines = []
 
-        # MOST IMPORTANT: Show active call status first
+        # ACTIVE CALL STATUS - just the fact
         if self.active_call_lead_id:
-            lines.append(
-                f"## ACTIVE CALL: Currently on call with {self.active_call_lead_name} ({self.active_call_lead_id})"
-            )
-            lines.append(
-                "   → You MUST use calling.propose_plan() or calling.end_call() before starting a new call!"
-            )
+            lines.append(f"ACTIVE CALL: {self.active_call_lead_name} ({self.active_call_lead_id})")
             lines.append("")
 
+        # AVAILABLE LEADS (uncalled from found_leads)
         uncalled = self.get_uncalled_leads()
         if uncalled:
-            lines.append("## AVAILABLE LEADS TO CALL")
+            lines.append(f"AVAILABLE LEADS ({len(uncalled)}):")
             for lead in uncalled:
                 lines.append(
-                    f"  - {lead.lead_id}: {lead.name} ({lead.temperature}, ${lead.income:,}/yr)"
+                    f"  {lead.lead_id}: {lead.name} ({lead.temperature}, ${lead.income:,}/yr)"
                 )
-        elif not self.active_call_lead_id:
-            # No uncalled leads and no active call
-            lines.append("## NO AVAILABLE LEADS TO CALL")
-            if self.searched_temperatures:
-                lines.append(
-                    f"   Already searched: {', '.join(sorted(self.searched_temperatures))}"
-                )
-            # Suggest what to do next
-            unsearched = {"hot", "warm", "cold"} - self.searched_temperatures
-            if unsearched:
-                lines.append(f"   → Try searching: {', '.join(sorted(unsearched))}")
-            else:
-                lines.append(
-                    "   → All temperature categories searched. Consider ending the episode or waiting."
-                )
+            lines.append("")
 
+        # SEARCH HISTORY - just show what was searched
+        if self.searched_temperatures:
+            lines.append(f"SEARCHED: {', '.join(sorted(self.searched_temperatures))}")
+
+        # COMPLETED
         if self.accepted_lead_ids:
-            lines.append(
-                f"## COMPLETED ({len(self.accepted_lead_ids)} accepted): {', '.join(sorted(self.accepted_lead_ids))}"
-            )
+            lines.append(f"ACCEPTED: {len(self.accepted_lead_ids)} leads")
 
-        if self.called_lead_ids - self.accepted_lead_ids:
-            rejected = self.called_lead_ids - self.accepted_lead_ids
-            lines.append(f"## CALLED BUT NOT ACCEPTED: {', '.join(sorted(rejected))}")
+        # CALLED BUT NOT ACCEPTED
+        rejected = self.called_lead_ids - self.accepted_lead_ids
+        if rejected:
+            lines.append(f"CALLED (not accepted): {len(rejected)} leads")
 
         return "\n".join(lines) if lines else ""
 

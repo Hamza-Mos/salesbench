@@ -151,6 +151,25 @@ class SalesEnv:
         self._episode_context = context
         self._calling_tools.set_episode_context(context)
 
+    def get_buyer_conversational_response(self, seller_message: str) -> Optional[str]:
+        """Get a conversational response from the buyer.
+
+        This is called when the seller speaks while in a call.
+        Returns a natural conversational response (not a decision).
+
+        Args:
+            seller_message: What the salesperson just said.
+
+        Returns:
+            The buyer's dialogue response, or None if not in a call.
+        """
+        return self._calling_tools.get_buyer_conversational_response(seller_message)
+
+    @property
+    def is_in_call(self) -> bool:
+        """Check if there's an active call."""
+        return self._state.active_call is not None
+
     def execute_tool(self, tool_call: ToolCall) -> ToolResult:
         """Execute a single tool call.
 

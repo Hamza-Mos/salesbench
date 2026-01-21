@@ -188,11 +188,12 @@ class Orchestrator:
 
         return observation
 
-    def step(self, tool_calls: list[ToolCall]) -> TurnResult:
+    def step(self, tool_calls: list[ToolCall], seller_message: Optional[str] = None) -> TurnResult:
         """Process a turn with the given tool calls.
 
         Args:
             tool_calls: List of tool calls from the seller agent.
+            seller_message: Optional message the seller spoke this turn.
 
         Returns:
             TurnResult with tool results and new observation.
@@ -274,15 +275,15 @@ class Orchestrator:
         turn_score = self._calculate_turn_score(tool_results)
         self._cumulative_score += turn_score
 
-        # Record history
-        self._history.append(
-            {
-                "turn": self._termination_checker.turn_count,
-                "tool_calls": [tc.to_dict() for tc in tool_calls],
-                "tool_results": [tr.to_dict() for tr in tool_results],
-                "score": turn_score,
-            }
-        )
+        # Record history (including seller message for JSON output)
+        history_entry = {
+            "turn": self._termination_checker.turn_count,
+            "seller_message": seller_message,
+            "tool_calls": [tc.to_dict() for tc in tool_calls],
+            "tool_results": [tr.to_dict() for tr in tool_results],
+            "score": turn_score,
+        }
+        self._history.append(history_entry)
 
         return TurnResult(
             tool_results=tool_results,
@@ -418,6 +419,37 @@ class Orchestrator:
             content=message,
             is_spoken_message=True,
         )
+
+    def get_buyer_response(self, seller_message: str) -> Optional[str]:
+        """Get a conversational response from the buyer.
+
+        This is called when the seller speaks while in a call.
+        Returns a natural conversational response (not a decision).
+
+        Args:
+            seller_message: What the salesperson just said.
+
+        Returns:
+            The buyer's dialogue response, or None if not in a call.
+        """
+        return self._env.get_buyer_conversational_response(seller_message)
+
+    @property
+    def is_in_call(self) -> bool:
+        """Check if there's an active call."""
+        return self._env.is_in_call
+
+    def record_buyer_conversation(self, dialogue: str) -> None:
+        """Record a buyer's conversational response to the last history entry.
+
+        This should be called after step() when the buyer responds to the seller
+        without making a decision (just conversation).
+
+        Args:
+            dialogue: What the buyer said.
+        """
+        if self._history:
+            self._history[-1]["buyer_response"] = dialogue
 
     def get_final_result(self) -> EpisodeResult:
         """Get the final result of the episode.

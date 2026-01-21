@@ -348,6 +348,45 @@ class CallingTools:
             return True
         return False
 
+    def get_buyer_conversational_response(self, seller_message: str) -> Optional[str]:
+        """Get a conversational response from the buyer (not a decision).
+
+        This is called when the seller speaks while in a call.
+        The buyer responds naturally based on their persona.
+
+        Args:
+            seller_message: What the salesperson just said.
+
+        Returns:
+            The buyer's dialogue response, or None if not in a call or no simulator.
+        """
+        # Must be in a call
+        if self.state.active_call is None:
+            return None
+
+        # Need a buyer simulator
+        if not self._buyer_simulator:
+            return None
+
+        session = self.state.active_call
+        lead = self.state.get_lead(session.lead_id)
+        if not lead:
+            return None
+
+        # Get conversation history
+        negotiation_history = None
+        if self._episode_context:
+            negotiation_history = self._episode_context.get_buyer_view(str(session.lead_id))
+
+        # Check if buyer simulator has the conversational response method
+        if hasattr(self._buyer_simulator, "get_conversational_response"):
+            return self._buyer_simulator.get_conversational_response(
+                lead, seller_message, session, negotiation_history
+            )
+
+        # Fallback: no conversational support
+        return None
+
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
         """Execute a calling tool.
 

@@ -175,11 +175,9 @@ class LLMSellerAgent(SellerAgent):
         self._api_key = api_key
         self._client: Optional[LLMClient] = None
         self._conversation_history: list[dict] = []
-        self._available_leads: list[dict] = []  # Track leads found but not yet called
-        self._called_lead_ids: set[str] = set()  # Track which leads we've called
-        self._accepted_lead_ids: set[str] = set()  # Track leads who accepted (don't call again)
-        self._exhausted_temps: set[str] = set()  # Temperature tiers that returned 0 leads
-        self._last_search_temp: Optional[str] = None  # Last temperature searched
+        self._available_leads: list[dict] = []  # Synced from AnchoredState
+        self._called_lead_ids: set[str] = set()  # Synced from AnchoredState
+        self._accepted_lead_ids: set[str] = set()  # Synced from AnchoredState
 
     def _get_client(self) -> LLMClient:
         """Get or create the LLM client."""
@@ -201,8 +199,35 @@ class LLMSellerAgent(SellerAgent):
         self._available_leads = []
         self._called_lead_ids = set()
         self._accepted_lead_ids = set()
-        self._exhausted_temps = set()
-        self._last_search_temp = None
+
+    def _sync_from_anchored_state(self, episode_context: Optional["EpisodeContext"]) -> None:
+        """Sync agent state from AnchoredState (single source of truth).
+
+        The agent should READ from AnchoredState, not maintain parallel state.
+        This ensures the agent always has accurate information about:
+        - Which leads have been found
+        - Which leads have been called
+        - Which leads have accepted
+        """
+        if episode_context is None:
+            return
+
+        anchored = episode_context._anchored_state
+        self._called_lead_ids = set(anchored.called_lead_ids)
+        self._accepted_lead_ids = set(anchored.accepted_lead_ids)
+
+        # Rebuild available leads from AnchoredState (uncalled, non-accepted)
+        self._available_leads = [
+            {
+                "lead_id": lead.lead_id,
+                "name": lead.name,
+                "temperature": lead.temperature,
+                "annual_income": lead.income,
+            }
+            for lead in anchored.found_leads.values()
+            if lead.lead_id not in anchored.called_lead_ids
+            and lead.lead_id not in anchored.accepted_lead_ids
+        ]
 
     def act(
         self,
@@ -222,7 +247,10 @@ class LLMSellerAgent(SellerAgent):
         Returns:
             SellerAction containing message and/or tool calls.
         """
-        # Build user message from observation (also updates lead tracking)
+        # Sync agent state from AnchoredState (single source of truth)
+        self._sync_from_anchored_state(episode_context)
+
+        # Build user message from observation
         user_message = self._build_user_message(observation)
 
         # Add to conversation history (for fallback when no episode_context)
@@ -235,57 +263,6 @@ class LLMSellerAgent(SellerAgent):
 
         # Get LLM response (returns message and tool_calls)
         message, tool_calls = self._call_llm(user_message, episode_context)
-
-        # HARD CONSTRAINT: Intercept redundant search_leads when we have uncalled leads
-        # This prevents models from looping on search forever
-        uncalled_leads = [
-            lead
-            for lead in self._available_leads
-            if lead.get("lead_id") not in self._called_lead_ids
-            and lead.get("lead_id") not in self._accepted_lead_ids
-        ]
-
-        if not observation.in_call:
-            corrected_calls = []
-            for tc in tool_calls:
-                if tc.tool_name == "crm.search_leads":
-                    if uncalled_leads:
-                        # Replace search with a call to the first available lead
-                        lead_id = uncalled_leads[0].get("lead_id", "")
-                        corrected_calls.append(
-                            ToolCall(
-                                tool_name="calling.start_call",
-                                arguments={"lead_id": lead_id},
-                                call_id=tc.call_id,
-                            )
-                        )
-                    else:
-                        # Check if searching exhausted temperature - redirect to next tier
-                        search_temp = tc.arguments.get("temperature", "hot")
-                        if search_temp in self._exhausted_temps:
-                            temp_order = ["hot", "warm", "lukewarm", "cold"]
-                            next_temp = None
-                            for temp in temp_order:
-                                if temp not in self._exhausted_temps:
-                                    next_temp = temp
-                                    break
-                            if next_temp:
-                                # Redirect to next available tier
-                                corrected_calls.append(
-                                    ToolCall(
-                                        tool_name="crm.search_leads",
-                                        arguments={**tc.arguments, "temperature": next_temp},
-                                        call_id=tc.call_id,
-                                    )
-                                )
-                            # else: all temps exhausted, let it fail naturally
-                            else:
-                                corrected_calls.append(tc)
-                        else:
-                            corrected_calls.append(tc)
-                else:
-                    corrected_calls.append(tc)
-            tool_calls = corrected_calls
 
         # Add assistant response to history
         assistant_content = message or ""
@@ -304,7 +281,12 @@ class LLMSellerAgent(SellerAgent):
         return SellerAction(tool_calls=tool_calls, message=message)
 
     def _build_user_message(self, obs: SellerObservation) -> str:
-        """Build user message from observation."""
+        """Build user message from observation.
+
+        Shows facts only - no directive language. The model decides based on context.
+        The AnchoredState context block (injected separately) provides the authoritative
+        state about leads, calls, and searches.
+        """
         lines = [
             "## Current State",
             f"- Day {obs.current_day}/10, Hour {obs.current_hour}:00",
@@ -318,14 +300,13 @@ class LLMSellerAgent(SellerAgent):
             lines.extend(
                 [
                     "",
-                    "## Active Call",
-                    f"- Lead: {obs.current_lead_id}",
+                    f"## In Call: {obs.current_lead_id}",
                     f"- Duration: {obs.call_duration} minutes",
-                    f"- Offers presented: {obs.offers_this_call}",
+                    f"- Offers made this call: {obs.offers_this_call}",
                 ]
             )
 
-        # Process tool results and update lead tracking
+        # Show tool results (just facts, no tracking updates - that's handled by AnchoredState)
         if obs.last_tool_results:
             lines.extend(
                 [
@@ -335,74 +316,11 @@ class LLMSellerAgent(SellerAgent):
             )
             for result in obs.last_tool_results:
                 if result.success:
-                    # Special handling for search results - update available leads
-                    if result.data and "leads" in result.data:
-                        leads = result.data["leads"]
-                        searched_temp = result.data.get("filters_applied", {}).get("temperature")
-                        if leads:
-                            # Found leads - clear this temp from exhausted
-                            if searched_temp:
-                                self._exhausted_temps.discard(searched_temp)
-                            # Update available leads list (exclude already called AND accepted leads)
-                            self._available_leads = [
-                                lead
-                                for lead in leads
-                                if lead.get("lead_id") not in self._called_lead_ids
-                                and lead.get("lead_id") not in self._accepted_lead_ids
-                            ]
-                            # Show all found, but mark accepted ones
-                            lines.append(f"✓ Found {len(leads)} leads:")
-                            for lead in leads:
-                                lead_id = lead.get("lead_id", "unknown")
-                                name = lead.get("name", "Unknown")
-                                temp = lead.get("temperature", "?")
-                                income = lead.get("annual_income", 0)
-                                risk = lead.get("risk_class", "?")
-                                dependents = lead.get("num_dependents", 0)
-                                status = (
-                                    " [ALREADY ACCEPTED - SKIP]"
-                                    if lead_id in self._accepted_lead_ids
-                                    else ""
-                                )
-                                lines.append(
-                                    f"  - {lead_id}: {name} ({temp}, ${income:,}/yr, {dependents} dependents, {risk} risk){status}"
-                                )
-                        else:
-                            # No leads found - mark this temperature as exhausted
-                            if searched_temp:
-                                self._exhausted_temps.add(searched_temp)
-                            lines.append(
-                                f"✓ Search returned 0 leads for '{searched_temp or 'this filter'}' - try next temperature tier."
-                            )
-                    # Track when we start a call
-                    elif result.data and result.data.get("call_started"):
-                        lead_id = result.data.get("lead_id", "")
-                        if lead_id:
-                            self._called_lead_ids.add(lead_id)
-                            # Remove from available leads
-                            self._available_leads = [
-                                lead
-                                for lead in self._available_leads
-                                if lead.get("lead_id") != lead_id
-                            ]
-                        data_str = json.dumps(result.data, default=str)
-                        lines.append(f"✓ {result.call_id}: {data_str}")
-                    # Track when a lead accepts (don't call them again!)
-                    elif result.data and result.data.get("decision") == "accept_plan":
-                        # Mark this lead as accepted
-                        if obs.current_lead_id:
-                            self._accepted_lead_ids.add(obs.current_lead_id)
-                        data_str = json.dumps(result.data, default=str)
-                        if len(data_str) > 1000:
-                            data_str = data_str[:1000] + "..."
-                        lines.append(f"✓ {result.call_id}: {data_str}")
-                        lines.append("  ⚠️ Lead ACCEPTED - call auto-ended, move to next lead!")
-                    else:
-                        # For other results, show full data (reasonably sized)
-                        data_str = json.dumps(result.data, default=str)
-                        if len(data_str) > 1000:
-                            data_str = data_str[:1000] + "..."
-                        lines.append(f"✓ {result.call_id}: {data_str}")
+                    # Format the result data
+                    data_str = json.dumps(result.data, default=str)
+                    if len(data_str) > 1000:
+                        data_str = data_str[:1000] + "..."
+                    lines.append(f"✓ {result.call_id}: {data_str}")
                 else:
                     lines.append(f"✗ {result.call_id}: {result.error}")
 
@@ -415,58 +333,17 @@ class LLMSellerAgent(SellerAgent):
                 ]
             )
 
-        # Show available leads if we have any (persisted from previous searches)
-        # Exclude both called and accepted leads
-        uncalled_leads = [
-            lead
-            for lead in self._available_leads
-            if lead.get("lead_id") not in self._called_lead_ids
-            and lead.get("lead_id") not in self._accepted_lead_ids
-        ]
-
-        # Add explicit next-action guidance based on state
+        # Current status section - just facts
         lines.append("")
+        uncalled_leads = self._available_leads  # Already filtered in _sync_from_anchored_state
         if obs.in_call:
             lines.append(
-                "## Next Action: You are in a call. Use `calling.propose_plan` to make an offer, or `calling.end_call` to end."
+                f"STATUS: In call with {obs.current_lead_id}, {obs.offers_this_call} offers made"
             )
         elif uncalled_leads:
-            # We have uncalled leads - strongly guide to call one
-            first_lead = uncalled_leads[0]
-            first_lead_id = first_lead.get("lead_id", "")
-            lines.append(f"## Available Leads ({len(uncalled_leads)} uncalled):")
-            for lead in uncalled_leads[:5]:  # Show up to 5
-                lead_id = lead.get("lead_id", "unknown")
-                name = lead.get("name", "Unknown")
-                lines.append(f"  - {lead_id}: {name}")
-            lines.append("")
-            lines.append(
-                f'## Next Action: CALL A LEAD NOW using `calling.start_call(lead_id="{first_lead_id}")`'
-            )
-            lines.append("DO NOT SEARCH AGAIN. You already have leads to call.")
+            lines.append(f"STATUS: {len(uncalled_leads)} uncalled leads available")
         else:
-            # Show exhausted temps and suggest next tier
-            temp_order = ["hot", "warm", "lukewarm", "cold"]
-            next_temp = None
-            for temp in temp_order:
-                if temp not in self._exhausted_temps:
-                    next_temp = temp
-                    break
-
-            if self._exhausted_temps:
-                lines.append(
-                    f"## Exhausted temperature tiers: {', '.join(sorted(self._exhausted_temps))}"
-                )
-
-            if next_temp:
-                lines.append(
-                    f'## Next Action: Search for leads with `crm.search_leads(temperature="{next_temp}")`, then call them.'
-                )
-            else:
-                # All temperatures exhausted
-                lines.append(
-                    "## All lead temperature tiers have been searched. Episode should end."
-                )
+            lines.append("STATUS: No leads available")
 
         return "\n".join(lines)
 
@@ -686,36 +563,8 @@ class LLMSellerAgent(SellerAgent):
         return None, self._fallback_action()
 
     def _fallback_action(self) -> list[ToolCall]:
-        """Generate a smart fallback action based on current state."""
-        # If we have available leads, call one instead of searching again
-        # Exclude accepted leads - they're already customers!
-        uncalled_leads = [
-            lead
-            for lead in self._available_leads
-            if lead.get("lead_id") not in self._called_lead_ids
-            and lead.get("lead_id") not in self._accepted_lead_ids
-        ]
-        if uncalled_leads:
-            lead_id = uncalled_leads[0].get("lead_id", "")
-            return [
-                ToolCall(
-                    tool_name="calling.start_call",
-                    arguments={"lead_id": lead_id},
-                )
-            ]
-        # Otherwise, search for leads - use next available temperature tier
-        temp_order = ["hot", "warm", "lukewarm", "cold"]
-        next_temp = "hot"
-        for temp in temp_order:
-            if temp not in self._exhausted_temps:
-                next_temp = temp
-                break
-        return [
-            ToolCall(
-                tool_name="crm.search_leads",
-                arguments={"temperature": next_temp, "limit": 10},
-            )
-        ]
+        """Raise error when LLM returns nothing - no silent fallbacks."""
+        raise RuntimeError("LLM returned no output (no message and no tool calls)")
 
 
 class StreamingLLMSellerAgent(LLMSellerAgent):
