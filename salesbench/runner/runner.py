@@ -183,40 +183,78 @@ class BenchmarkRunner:
         Returns:
             List of episode results.
         """
-        semaphore = asyncio.Semaphore(self.config.parallelism)
         results = []
+        total = self.config.num_episodes
 
-        async def run_with_semaphore(episode_index: int) -> EpisodeResult:
-            async with semaphore:
-                return await self._run_single_episode(
-                    episode_index=episode_index,
+        if self.config.parallelism == 1:
+            # Sequential execution - guarantees order
+            for i in range(total):
+                ep_result = await self._run_single_episode(
+                    episode_index=i,
                     seller_config=seller_config,
                     buyer_simulator=buyer_simulator,
                     seller_model_spec=seller_model_spec,
                     buyer_model_spec=buyer_model_spec,
                 )
+                results.append(ep_result)
+                self._print_episode_progress(ep_result, completed_count=None)
+        else:
+            # Parallel execution with semaphore
+            semaphore = asyncio.Semaphore(self.config.parallelism)
+            completed = 0
 
-        # Create tasks for all episodes
-        tasks = [run_with_semaphore(i) for i in range(self.config.num_episodes)]
+            async def run_with_semaphore(episode_index: int) -> EpisodeResult:
+                async with semaphore:
+                    return await self._run_single_episode(
+                        episode_index=episode_index,
+                        seller_config=seller_config,
+                        buyer_simulator=buyer_simulator,
+                        seller_model_spec=seller_model_spec,
+                        buyer_model_spec=buyer_model_spec,
+                    )
 
-        # Run with progress tracking
-        for coro in asyncio.as_completed(tasks):
-            ep_result = await coro
-            results.append(ep_result)
+            # Create tasks for all episodes
+            tasks = [run_with_semaphore(i) for i in range(total)]
 
-            # Progress output
-            status = "OK" if ep_result.succeeded else "FAIL"
-            accepts = ep_result.total_accepts
-            score = ep_result.final_score
-            duration = ep_result.duration_seconds
+            # Run with progress tracking (as_completed yields in completion order)
+            for coro in asyncio.as_completed(tasks):
+                ep_result = await coro
+                results.append(ep_result)
+                completed += 1
+                self._print_episode_progress(ep_result, completed_count=completed)
 
+        return results
+
+    def _print_episode_progress(
+        self, ep_result: EpisodeResult, completed_count: int | None
+    ) -> None:
+        """Print progress for a completed episode.
+
+        Args:
+            ep_result: The episode result.
+            completed_count: If provided, shows "Completed X/Y" format for parallel mode.
+                           If None, shows "Episode X/Y" format for sequential mode.
+        """
+        status = "OK" if ep_result.succeeded else "FAIL"
+        accepts = ep_result.total_accepts
+        score = ep_result.final_score
+        duration = ep_result.duration_seconds
+        total = self.config.num_episodes
+
+        if completed_count is None:
+            # Sequential mode: Episode 1/100 (seed=42): ...
             self.output_callback(
-                f"Episode {ep_result.episode_index + 1}/{self.config.num_episodes} "
+                f"Episode {ep_result.episode_index + 1}/{total} "
                 f"(seed={ep_result.seed}): score={score:.2f}, accepts={accepts} "
                 f"[{duration:.1f}s] [{status}]"
             )
-
-        return results
+        else:
+            # Parallel mode: Completed 1/100 [Episode 59] (seed=100): ...
+            self.output_callback(
+                f"Completed {completed_count}/{total} [Episode {ep_result.episode_index + 1}] "
+                f"(seed={ep_result.seed}): score={score:.2f}, accepts={accepts} "
+                f"[{duration:.1f}s] [{status}]"
+            )
 
     async def _run_single_episode(
         self,
@@ -417,6 +455,43 @@ class BenchmarkRunner:
                 self.output_callback(
                     f"  Total:  {seller_in + buyer_in:,} input, {seller_out + buyer_out:,} output"
                 )
+
+            # Cost breakdown
+            cost_breakdown = metrics.get("total_cost_breakdown", {})
+            if cost_breakdown:
+                self.output_callback("")
+                self.output_callback("Cost Breakdown (all episodes):")
+                seller_in_cost = cost_breakdown.get("seller_input_cost", 0)
+                seller_out_cost = cost_breakdown.get("seller_output_cost", 0)
+                buyer_in_cost = cost_breakdown.get("buyer_input_cost", 0)
+                buyer_out_cost = cost_breakdown.get("buyer_output_cost", 0)
+                total_cost = cost_breakdown.get("total_cost", 0)
+                seller_available = cost_breakdown.get("seller_pricing_available", False)
+                buyer_available = cost_breakdown.get("buyer_pricing_available", False)
+
+                if seller_available:
+                    self.output_callback(
+                        f"  Seller: ${seller_in_cost:.4f} input, ${seller_out_cost:.4f} output"
+                    )
+                else:
+                    self.output_callback("  Seller: N/A (pricing not available)")
+
+                if buyer_available:
+                    self.output_callback(
+                        f"  Buyer:  ${buyer_in_cost:.4f} input, ${buyer_out_cost:.4f} output"
+                    )
+                else:
+                    self.output_callback("  Buyer:  N/A (pricing not available)")
+
+                if seller_available and buyer_available:
+                    total_in = seller_in_cost + buyer_in_cost
+                    total_out = seller_out_cost + buyer_out_cost
+                    self.output_callback(
+                        f"  Total:  ${total_in:.4f} input, ${total_out:.4f} output"
+                    )
+                    self.output_callback(f"  Total Cost: ${total_cost:.4f}")
+                elif seller_available or buyer_available:
+                    self.output_callback(f"  Partial Total Cost: ${total_cost:.4f}")
 
         self.output_callback("")
 

@@ -12,7 +12,7 @@ from typing import Any, Callable, Optional
 from salesbench.models import ModelSpec
 from salesbench.runner.config import BenchmarkConfig
 from salesbench.runner.integrations import IntegrationManager
-from salesbench.runner.results import EpisodeResult, TokenUsage
+from salesbench.runner.results import EpisodeResult, TokenUsage, calculate_cost_breakdown
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +138,13 @@ class EpisodeExecutor:
                     buyer_input, buyer_output = buyer_simulator.get_token_usage()
                     token_usage.add_buyer_usage(buyer_input, buyer_output)
                 result.token_usage = token_usage
+
+                # Calculate cost breakdown based on token usage and model pricing
+                seller_model = self.seller_model_spec.model if self.seller_model_spec else ""
+                buyer_model = self.buyer_model_spec.model if self.buyer_model_spec else ""
+                result.cost_breakdown = calculate_cost_breakdown(
+                    token_usage, seller_model, buyer_model
+                )
 
                 # Record to span
                 episode_span.finish(

@@ -73,6 +73,125 @@ class TokenUsage:
 
 
 @dataclass
+class CostBreakdown:
+    """Tracks cost breakdown by role and token type.
+
+    Attributes:
+        seller_input_cost: Cost of seller input tokens in USD.
+        seller_output_cost: Cost of seller output tokens in USD.
+        buyer_input_cost: Cost of buyer input tokens in USD.
+        buyer_output_cost: Cost of buyer output tokens in USD.
+        seller_pricing_available: Whether pricing info was available for seller model.
+        buyer_pricing_available: Whether pricing info was available for buyer model.
+    """
+
+    seller_input_cost: float = 0.0
+    seller_output_cost: float = 0.0
+    buyer_input_cost: float = 0.0
+    buyer_output_cost: float = 0.0
+    seller_pricing_available: bool = False
+    buyer_pricing_available: bool = False
+
+    @property
+    def seller_total_cost(self) -> float:
+        """Total cost for seller."""
+        return self.seller_input_cost + self.seller_output_cost
+
+    @property
+    def buyer_total_cost(self) -> float:
+        """Total cost for buyer."""
+        return self.buyer_input_cost + self.buyer_output_cost
+
+    @property
+    def total_input_cost(self) -> float:
+        """Total input token cost."""
+        return self.seller_input_cost + self.buyer_input_cost
+
+    @property
+    def total_output_cost(self) -> float:
+        """Total output token cost."""
+        return self.seller_output_cost + self.buyer_output_cost
+
+    @property
+    def total_cost(self) -> float:
+        """Total cost (all tokens)."""
+        return self.total_input_cost + self.total_output_cost
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "seller_input_cost": self.seller_input_cost,
+            "seller_output_cost": self.seller_output_cost,
+            "buyer_input_cost": self.buyer_input_cost,
+            "buyer_output_cost": self.buyer_output_cost,
+            "seller_total_cost": self.seller_total_cost,
+            "buyer_total_cost": self.buyer_total_cost,
+            "total_input_cost": self.total_input_cost,
+            "total_output_cost": self.total_output_cost,
+            "total_cost": self.total_cost,
+            "seller_pricing_available": self.seller_pricing_available,
+            "buyer_pricing_available": self.buyer_pricing_available,
+        }
+
+    def __add__(self, other: "CostBreakdown") -> "CostBreakdown":
+        """Add two CostBreakdown instances."""
+        return CostBreakdown(
+            seller_input_cost=self.seller_input_cost + other.seller_input_cost,
+            seller_output_cost=self.seller_output_cost + other.seller_output_cost,
+            buyer_input_cost=self.buyer_input_cost + other.buyer_input_cost,
+            buyer_output_cost=self.buyer_output_cost + other.buyer_output_cost,
+            # AND logic: all episodes must have pricing for aggregate to be complete
+            seller_pricing_available=self.seller_pricing_available
+            and other.seller_pricing_available,
+            buyer_pricing_available=self.buyer_pricing_available and other.buyer_pricing_available,
+        )
+
+
+def calculate_cost_breakdown(
+    token_usage: TokenUsage,
+    seller_model: str,
+    buyer_model: str,
+) -> CostBreakdown:
+    """Calculate cost breakdown from token usage and model names.
+
+    Args:
+        token_usage: Token counts for seller and buyer.
+        seller_model: Model name for seller (e.g., "gpt-4o").
+        buyer_model: Model name for buyer (e.g., "gpt-4o-mini").
+
+    Returns:
+        CostBreakdown with costs calculated from model pricing.
+    """
+    from salesbench.models import SUPPORTED_MODELS
+
+    breakdown = CostBreakdown()
+
+    # Calculate seller costs
+    seller_config = SUPPORTED_MODELS.get(seller_model)
+    if seller_config and seller_config.input_price_per_million is not None:
+        breakdown.seller_input_cost = (
+            token_usage.seller_input_tokens * seller_config.input_price_per_million / 1_000_000
+        )
+        breakdown.seller_output_cost = (
+            token_usage.seller_output_tokens * seller_config.output_price_per_million / 1_000_000
+        )
+        breakdown.seller_pricing_available = True
+
+    # Calculate buyer costs
+    buyer_config = SUPPORTED_MODELS.get(buyer_model)
+    if buyer_config and buyer_config.input_price_per_million is not None:
+        breakdown.buyer_input_cost = (
+            token_usage.buyer_input_tokens * buyer_config.input_price_per_million / 1_000_000
+        )
+        breakdown.buyer_output_cost = (
+            token_usage.buyer_output_tokens * buyer_config.output_price_per_million / 1_000_000
+        )
+        breakdown.buyer_pricing_available = True
+
+    return breakdown
+
+
+@dataclass
 class EpisodeResult:
     """Result of a single episode execution.
 
@@ -95,6 +214,7 @@ class EpisodeResult:
         error: Error message if failed.
         metrics: Full metrics dict from orchestrator.
         token_usage: Token usage for cost estimation.
+        cost_breakdown: Cost breakdown by role and token type.
     """
 
     episode_id: str
@@ -116,6 +236,7 @@ class EpisodeResult:
     metrics: dict = field(default_factory=dict)
     trajectory: list[dict] = field(default_factory=list)  # Full conversation history
     token_usage: TokenUsage = field(default_factory=TokenUsage)
+    cost_breakdown: CostBreakdown = field(default_factory=CostBreakdown)
 
     @property
     def succeeded(self) -> bool:
@@ -158,6 +279,7 @@ class EpisodeResult:
             "metrics": self.metrics,
             "trajectory": self.trajectory,
             "token_usage": self.token_usage.to_dict(),
+            "cost_breakdown": self.cost_breakdown.to_dict(),
         }
 
 
@@ -281,6 +403,14 @@ class BenchmarkResult:
         for e in self.episode_results:
             total_tokens = total_tokens + e.token_usage
 
+        # Aggregate cost breakdown across all episodes
+        total_cost = CostBreakdown(
+            seller_pricing_available=True,
+            buyer_pricing_available=True,
+        )
+        for e in self.episode_results:
+            total_cost = total_cost + e.cost_breakdown
+
         metrics = {
             "n_episodes": n,
             "completed_episodes": self.completed_episodes,
@@ -307,6 +437,8 @@ class BenchmarkResult:
             "mean_episode_duration": statistics.mean(durations),
             # Token usage
             "total_token_usage": total_tokens.to_dict(),
+            # Cost breakdown
+            "total_cost_breakdown": total_cost.to_dict(),
         }
 
         self.aggregate_metrics = metrics

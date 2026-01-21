@@ -68,10 +68,19 @@ def create_leaderboard(
 
         return rows
 
+    def get_run_choices():
+        """Get list of available runs for dropdown."""
+        data = writer.get_leaderboard_data()
+        choices = []
+        for r in data:
+            label = f"{r.get('model', 'unknown')} - {r.get('benchmark_id', 'unknown')[:12]} ({r.get('timestamp', '')[:10]})"
+            choices.append((label, r.get("benchmark_id", "")))
+        return choices
+
     def load_result_details(benchmark_id: str) -> str:
         """Load detailed results for a specific benchmark."""
         if not benchmark_id:
-            return "Select a benchmark to view details."
+            return "Select a benchmark run from the dropdown above to view details."
 
         result = writer.get_result_by_id(benchmark_id)
         if not result:
@@ -89,18 +98,45 @@ def create_leaderboard(
 - **Episodes**: {result.get('completed_episodes', 0)}
 - **Mode**: {config.get('mode', 'unknown')}
 
-### Results
+### Aggregate Results
 - **Mean Score**: {aggregate.get('mean_score', 0):.2f} (std: {aggregate.get('std_score', 0):.2f})
 - **Acceptance Rate**: {aggregate.get('mean_acceptance_rate', 0):.1%}
 - **Mean Calls**: {aggregate.get('mean_calls', 0):.1f}
 - **Mean Offers**: {aggregate.get('mean_offers', 0):.1f}
-- **Duration**: {result.get('duration_seconds', 0):.1f}s
+- **Total Duration**: {result.get('duration_seconds', 0):.1f}s
 
 ### Timing
 - **Started**: {result.get('started_at', 'unknown')}
 - **Completed**: {result.get('completed_at', 'unknown')}
 """
         return details
+
+    def load_episode_table(benchmark_id: str):
+        """Load episode-level results for a specific benchmark."""
+        if not benchmark_id:
+            return []
+
+        result = writer.get_result_by_id(benchmark_id)
+        if not result:
+            return []
+
+        episodes = result.get("episode_results", [])
+        rows = []
+        for ep in episodes:
+            metrics = ep.get("metrics", {})
+            rows.append(
+                [
+                    ep.get("episode_index", 0) + 1,
+                    ep.get("seed", ""),
+                    f"{ep.get('score', 0):.1f}",
+                    metrics.get("accepted_offers", 0),
+                    metrics.get("rejected_offers", 0),
+                    metrics.get("total_calls", 0),
+                    ep.get("total_turns", 0),
+                    ep.get("termination_reason", "")[:50],
+                ]
+            )
+        return rows
 
     with gr.Blocks(
         title=title,
@@ -146,6 +182,70 @@ Benchmarking AI agents on sales conversations.
 - **Accept Rate**: Percentage of offers accepted by buyers
 - **Episodes**: Number of independent sales sessions evaluated
                 """)
+
+            with gr.Tab("Run Details"):
+                gr.Markdown("### Select a benchmark run to view detailed results")
+
+                run_dropdown = gr.Dropdown(
+                    choices=get_run_choices(),
+                    label="Select Benchmark Run",
+                    value=None,
+                    interactive=True,
+                )
+
+                refresh_btn = gr.Button("🔄 Refresh Run List", size="sm")
+
+                details_output = gr.Markdown(
+                    value="Select a benchmark run from the dropdown above to view details."
+                )
+
+                gr.Markdown("### Episode Results")
+                episode_table = gr.Dataframe(
+                    value=[],
+                    headers=[
+                        "Episode",
+                        "Seed",
+                        "Score",
+                        "Accepts",
+                        "Rejects",
+                        "Calls",
+                        "Turns",
+                        "Termination",
+                    ],
+                    datatype=[
+                        "number",
+                        "str",
+                        "str",
+                        "number",
+                        "number",
+                        "number",
+                        "number",
+                        "str",
+                    ],
+                    interactive=False,
+                )
+
+                # Wire up the dropdown to update details and episode table
+                run_dropdown.change(
+                    fn=load_result_details,
+                    inputs=[run_dropdown],
+                    outputs=[details_output],
+                )
+                run_dropdown.change(
+                    fn=load_episode_table,
+                    inputs=[run_dropdown],
+                    outputs=[episode_table],
+                )
+
+                # Refresh button updates dropdown choices
+                def refresh_choices():
+                    return gr.Dropdown(choices=get_run_choices())
+
+                refresh_btn.click(
+                    fn=refresh_choices,
+                    inputs=[],
+                    outputs=[run_dropdown],
+                )
 
             with gr.Tab("How to Submit"):
                 gr.Markdown("""

@@ -28,6 +28,8 @@ class ModelConfig:
     provider: str
     compression_threshold: float = 0.8
     reserved_system_tokens: int = 2000
+    input_price_per_million: Optional[float] = None  # $ per 1M input tokens
+    output_price_per_million: Optional[float] = None  # $ per 1M output tokens
 
     @property
     def available_context(self) -> int:
@@ -44,46 +46,93 @@ class ModelConfig:
 SUPPORTED_MODELS: dict[str, ModelConfig] = {
     # ============= OpenAI (Frontier) =============
     # GPT-5.2 series (latest - 400K context)
-    "gpt-5.2": ModelConfig(400_000, 128_000, "openai"),
-    "gpt-5.2-mini": ModelConfig(400_000, 128_000, "openai"),
-    "gpt-5.2-chat": ModelConfig(128_000, 16_384, "openai"),  # Instant mode
+    "gpt-5.2": ModelConfig(
+        400_000, 128_000, "openai", input_price_per_million=1.75, output_price_per_million=14.00
+    ),
+    "gpt-5-mini": ModelConfig(
+        400_000, 128_000, "openai", input_price_per_million=0.25, output_price_per_million=2.00
+    ),
+    "gpt-5-nano": ModelConfig(
+        128_000, 16_384, "openai", input_price_per_million=0.05, output_price_per_million=0.40
+    ),
     # GPT-5 series
-    "gpt-5": ModelConfig(400_000, 128_000, "openai"),
-    "gpt-5-thinking": ModelConfig(196_000, 32_000, "openai"),
+    "gpt-5": ModelConfig(
+        400_000, 128_000, "openai", input_price_per_million=1.25, output_price_per_million=10.00
+    ),
     # O-series reasoning (latest)
-    "o4-mini": ModelConfig(200_000, 100_000, "openai"),
-    "o3": ModelConfig(200_000, 100_000, "openai"),
-    "o3-pro": ModelConfig(200_000, 100_000, "openai"),
+    "o4-mini": ModelConfig(
+        200_000, 100_000, "openai", input_price_per_million=1.10, output_price_per_million=4.40
+    ),
+    "o3": ModelConfig(
+        200_000, 100_000, "openai", input_price_per_million=2.00, output_price_per_million=8.00
+    ),
+    "o3-pro": ModelConfig(
+        200_000, 100_000, "openai", input_price_per_million=20.00, output_price_per_million=80.00
+    ),
     # GPT-4o (kept for buyer model - cost efficient)
-    "gpt-4o": ModelConfig(128_000, 16_384, "openai"),
-    "gpt-4o-mini": ModelConfig(128_000, 16_384, "openai"),
+    "gpt-4o": ModelConfig(
+        128_000, 16_384, "openai", input_price_per_million=2.50, output_price_per_million=10.00
+    ),
+    "gpt-4o-mini": ModelConfig(
+        128_000, 16_384, "openai", input_price_per_million=0.15, output_price_per_million=0.60
+    ),
     # ============= Anthropic (Frontier) =============
     # Claude 4.5 series (latest)
-    "claude-opus-4-5-20251101": ModelConfig(200_000, 64_000, "anthropic"),
-    "claude-sonnet-4-5-20250929": ModelConfig(200_000, 64_000, "anthropic"),
-    "claude-haiku-4-5-20251001": ModelConfig(200_000, 64_000, "anthropic"),
+    "claude-opus-4-5-20251101": ModelConfig(
+        200_000, 64_000, "anthropic", input_price_per_million=5.00, output_price_per_million=25.00
+    ),
+    "claude-sonnet-4-5-20250929": ModelConfig(
+        200_000, 64_000, "anthropic", input_price_per_million=3.00, output_price_per_million=15.00
+    ),
+    "claude-haiku-4-5-20251001": ModelConfig(
+        200_000, 64_000, "anthropic", input_price_per_million=1.00, output_price_per_million=5.00
+    ),
     # ============= Google Gemini (Frontier) =============
     # Gemini 3 series (latest)
-    "gemini-3-pro": ModelConfig(1_048_576, 65_536, "google"),
-    "gemini-3-flash": ModelConfig(1_048_576, 65_536, "google"),
+    "gemini-3-pro": ModelConfig(
+        1_048_576, 65_536, "google", input_price_per_million=2.00, output_price_per_million=12.00
+    ),
+    "gemini-3-flash": ModelConfig(
+        1_048_576, 65_536, "google", input_price_per_million=0.50, output_price_per_million=3.00
+    ),
     # Gemini 2.5 series
-    "gemini-2.5-pro": ModelConfig(1_048_576, 65_536, "google"),
-    "gemini-2.5-flash": ModelConfig(1_048_576, 65_536, "google"),
+    "gemini-2.5-pro": ModelConfig(
+        1_048_576, 65_536, "google", input_price_per_million=1.25, output_price_per_million=10.00
+    ),
+    "gemini-2.5-flash": ModelConfig(
+        1_048_576, 65_536, "google", input_price_per_million=0.30, output_price_per_million=2.50
+    ),
     # ============= xAI Grok (Frontier) =============
     # Grok 4 series (latest - 2M context)
-    "grok-4-1-fast": ModelConfig(2_000_000, 8_000, "xai"),
+    "grok-4-1-fast": ModelConfig(
+        2_000_000, 8_000, "xai", input_price_per_million=0.20, output_price_per_million=0.50
+    ),
     # ============= Open Source via OpenRouter/Together (Frontier) =============
     # DeepSeek (latest)
-    "deepseek-v3.2": ModelConfig(128_000, 8_192, "openrouter"),
-    "deepseek-v3.2-speciale": ModelConfig(128_000, 8_192, "openrouter"),
-    "deepseek-r1": ModelConfig(128_000, 8_192, "openrouter"),
+    "deepseek-v3.2": ModelConfig(
+        128_000, 8_192, "openrouter", input_price_per_million=0.28, output_price_per_million=0.42
+    ),
+    "deepseek-v3.2-speciale": ModelConfig(
+        128_000, 8_192, "openrouter", input_price_per_million=0.28, output_price_per_million=0.42
+    ),
+    "deepseek-r1": ModelConfig(
+        128_000, 8_192, "openrouter", input_price_per_million=0.55, output_price_per_million=2.19
+    ),
     # Llama 3.3 (latest stable)
-    "llama-3.3-70b-instruct": ModelConfig(131_000, 4_096, "openrouter"),
+    "llama-3.3-70b-instruct": ModelConfig(
+        131_000, 4_096, "openrouter", input_price_per_million=0.10, output_price_per_million=0.32
+    ),
     # Qwen3 (latest)
-    "qwen3-coder-480b": ModelConfig(256_000, 32_768, "openrouter"),
-    "qwen3-235b-a22b": ModelConfig(262_000, 16_384, "openrouter"),
+    "qwen3-coder-480b": ModelConfig(
+        256_000, 32_768, "openrouter", input_price_per_million=0.22, output_price_per_million=0.95
+    ),
+    "qwen3-235b-a22b": ModelConfig(
+        262_000, 16_384, "openrouter", input_price_per_million=0.45, output_price_per_million=3.50
+    ),
     # GLM (latest)
-    "glm-4.6": ModelConfig(200_000, 8_192, "openrouter"),
+    "glm-4.6": ModelConfig(
+        200_000, 8_192, "openrouter", input_price_per_million=0.35, output_price_per_million=1.55
+    ),
 }
 
 # Build KNOWN_MODELS from SUPPORTED_MODELS for backward compatibility

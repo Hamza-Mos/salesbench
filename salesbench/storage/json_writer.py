@@ -136,10 +136,10 @@ class JSONResultsWriter:
         """List all result files, sorted by modification time (newest first).
 
         Returns:
-            List of paths to result files.
+            List of paths to summary.json files in result directories.
         """
         return sorted(
-            self.results_dir.glob("*.json"),
+            self.results_dir.glob("*/summary.json"),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -214,8 +214,12 @@ class JSONResultsWriter:
             Parsed result dictionary, or None if not found.
         """
         for path in self.list_results():
-            if path.name.startswith(benchmark_id):
-                return self.load_result(path)
+            try:
+                data = self.load_result(path)
+                if data.get("benchmark_id", "").startswith(benchmark_id):
+                    return data
+            except Exception:
+                continue
         return None
 
     def delete_result(self, path: Path) -> bool:
