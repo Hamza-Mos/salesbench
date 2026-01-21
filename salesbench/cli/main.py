@@ -188,6 +188,24 @@ def run_episode_command(args: argparse.Namespace) -> int:
     Returns:
         Exit code.
     """
+    # Initialize telemetry if enabled
+    telemetry_manager = None
+    try:
+        from salesbench.telemetry.otel import TelemetryConfig, TelemetryManager
+
+        telemetry_config = TelemetryConfig()
+        if telemetry_config.enabled:
+            telemetry_manager = TelemetryManager(telemetry_config)
+            if telemetry_manager.init():
+                print("Telemetry: enabled (traces will be sent to Grafana)")
+            else:
+                print("Telemetry: failed to initialize")
+                telemetry_manager = None
+        else:
+            print("Telemetry: disabled (set OTEL_ENABLED=true to enable)")
+    except ImportError:
+        print("Telemetry: not available (missing opentelemetry packages)")
+
     from salesbench.agents.buyer_llm import create_buyer_simulator
     from salesbench.agents.seller_llm import LLMSellerAgent
     from salesbench.core.config import SalesBenchConfig
@@ -250,6 +268,15 @@ def run_episode_command(args: argparse.Namespace) -> int:
     print(f"Buyer: {buyer_spec}")
     print("-" * 60)
 
+    # Get telemetry span manager if available
+    span_manager = None
+    if telemetry_manager:
+        try:
+            from salesbench.telemetry.spans import get_span_manager
+            span_manager = get_span_manager()
+        except ImportError:
+            pass
+
     from salesbench.agents.seller_base import SellerObservation
     from salesbench.core.types import ToolResult
 
@@ -297,65 +324,214 @@ def run_episode_command(args: argparse.Namespace) -> int:
     # Get tool schemas for the agent
     tool_schemas = orchestrator.env.get_tools_schema()
 
-    turn = 0
-    while not orchestrator.is_terminated and turn < args.max_turns:
-        turn += 1
+    # Create episode span for telemetry
+    import uuid
+    from contextlib import nullcontext
+    episode_id = f"episode_{uuid.uuid4().hex[:8]}"
 
-        # Convert dict to SellerObservation for the agent
-        obs = dict_to_observation(obs_dict)
-
-        # LLM agent generates action (message + tool calls)
+    # Get tracer for detailed spans
+    tracer = None
+    if telemetry_manager:
         try:
-            action = seller_agent.act(
-                obs,
-                tool_schemas,
-                episode_context=orchestrator.episode_context,
-            )
-        except Exception as e:
-            print(f"\nError from LLM seller: {e}")
-            break
+            from salesbench.telemetry.otel import get_tracer
+            tracer = get_tracer()
+        except ImportError:
+            pass
 
-        # Extract tool calls from action
-        tool_calls = action.tool_calls if action else []
-        message = action.message if action else None
+    # Display names for telemetry
+    display_seller_model = str(seller_spec)
+    display_buyer_model = str(buyer_spec)
 
-        if not tool_calls and not message:
-            print(f"\nTurn {turn}: Agent returned no action, ending episode.")
-            break
+    def run_episode_with_tracing(episode_span):
+        """Run episode loop, logging to the provided span."""
+        nonlocal obs_dict
+        turn = 0
 
-        # Step environment with tool calls (message is handled separately)
-        result = orchestrator.step(tool_calls) if tool_calls else None
+        # Set episode attributes
+        if episode_span:
+            episode_span.set_attribute("episode.id", episode_id)
+            episode_span.set_attribute("episode.seed", args.seed)
+            episode_span.set_attribute("episode.num_leads", args.leads)
+            episode_span.set_attribute("model.seller", display_seller_model)
+            episode_span.set_attribute("model.buyer", display_buyer_model)
 
-        if args.verbose:
-            print(f"\nTurn {turn}:")
-            if message:
-                print(f"  💬 {message[:200]}{'...' if len(message) > 200 else ''}")
-            for tc in tool_calls:
-                print(f"  → {tc.tool_name}({tc.arguments})")
-            if result:
-                for tr in result.tool_results:
-                    status = "OK" if tr.success else "FAIL"
-                    print(f"  ← [{status}] {tr.data or tr.error}")
-                    # Show conversation after propose_plan
-                    if tr.success and tr.data:
-                        # Show seller's pitch if provided
-                        if "seller_pitch" in tr.data and tr.data["seller_pitch"]:
-                            print(f"  🗣️  Seller: \"{tr.data['seller_pitch']}\"")
-                        # Show buyer's dialogue
-                        if "dialogue" in tr.data and tr.data["dialogue"]:
-                            print(f"  📞 Buyer: \"{tr.data['dialogue']}\"")
+        while not orchestrator.is_terminated and turn < args.max_turns:
+            turn += 1
 
-        if result and result.terminated:
-            print(f"\nEpisode terminated: {result.termination_reason}")
-            break
+            # Create turn span as child of episode (using context manager for proper nesting)
+            turn_context = tracer.start_as_current_span(f"turn_{turn}") if tracer else nullcontext()
 
-        if result:
-            obs_dict = result.observation
-            # CRITICAL: Include tool results in the observation for the agent
-            obs_dict["last_tool_results"] = [tr.to_dict() for tr in result.tool_results]
+            with turn_context as turn_span:
+                if turn_span:
+                    turn_span.set_attribute("turn.number", turn)
 
-    # Print final results
-    final = orchestrator.get_final_result()
+                # Convert dict to SellerObservation for the agent
+                obs = dict_to_observation(obs_dict)
+
+                # Build the prompt that will be sent to LLM (for logging)
+                # This mirrors what _build_user_message does in the agent
+                prompt_summary = f"Day {obs.current_day}, Hour {obs.current_hour}, "
+                prompt_summary += f"Calls: {obs.total_calls}, Accepts: {obs.total_accepts}"
+                if obs.in_call:
+                    prompt_summary += f" | IN CALL with {obs.current_lead_id}"
+
+                # LLM agent generates action (message + tool calls)
+                try:
+                    # LLM call span nested under turn span
+                    llm_context = tracer.start_as_current_span("llm_call") if tracer else nullcontext()
+                    with llm_context as llm_span:
+                        if llm_span:
+                            llm_span.set_attribute("llm.model", display_seller_model)
+                            # Log the input context
+                            llm_span.add_event("llm_input", {
+                                "prompt_summary": prompt_summary,
+                                "in_call": obs.in_call,
+                                "current_lead": obs.current_lead_id or "",
+                                "day": obs.current_day,
+                                "hour": obs.current_hour,
+                            })
+
+                        action = seller_agent.act(
+                            obs,
+                            tool_schemas,
+                            episode_context=orchestrator.episode_context,
+                        )
+
+                        if llm_span and action:
+                            llm_span.set_attribute("llm.has_message", bool(action.message))
+                            llm_span.set_attribute("llm.tool_count", len(action.tool_calls))
+
+                            # Log the full LLM response
+                            response_text = action.message or ""
+                            tool_calls_str = ", ".join([
+                                f"{tc.tool_name}({json.dumps(tc.arguments)})"
+                                for tc in action.tool_calls
+                            ]) if action.tool_calls else ""
+
+                            # Add response as event with full text
+                            llm_span.add_event("llm_output", {
+                                "response_message": response_text[:2000] if response_text else "",
+                                "tool_calls": tool_calls_str[:1000] if tool_calls_str else "",
+                            })
+
+                            # Also store full response as attribute (for easy viewing)
+                            if response_text:
+                                llm_span.set_attribute("llm.response", response_text[:4000])
+                            if tool_calls_str:
+                                llm_span.set_attribute("llm.tool_calls", tool_calls_str[:2000])
+
+                except Exception as e:
+                    print(f"\nError from LLM seller: {e}")
+                    if turn_span:
+                        turn_span.set_attribute("turn.error", str(e))
+                    break
+
+                # Extract tool calls from action
+                tool_calls = action.tool_calls if action else []
+                message = action.message if action else None
+
+                # Log message to span (full text)
+                if turn_span and message:
+                    turn_span.set_attribute("seller.message", message[:2000] if len(message) > 2000 else message)
+                    turn_span.add_event("seller_message", {"message": message[:500]})
+
+                if not tool_calls and not message:
+                    print(f"\nTurn {turn}: Agent returned no action, ending episode.")
+                    if turn_span:
+                        turn_span.add_event("no_action", {"reason": "agent returned empty"})
+                    break
+
+                # Log tool calls to span
+                if turn_span and tool_calls:
+                    tool_names = [tc.tool_name for tc in tool_calls]
+                    turn_span.set_attribute("tools.called", ",".join(tool_names))
+
+                # Step environment with tool calls
+                result = orchestrator.step(tool_calls) if tool_calls else None
+
+                # Process results and log to span
+                if result:
+                    for tr in result.tool_results:
+                        if turn_span:
+                            event_attrs = {
+                                "tool": tr.call_id or "unknown",
+                                "success": tr.success,
+                            }
+                            if tr.error:
+                                event_attrs["error"] = tr.error
+                            if tr.data:
+                                if "decision" in tr.data:
+                                    decision = tr.data["decision"]
+                                    event_attrs["buyer_decision"] = decision
+                                    if decision == "accept_plan":
+                                        turn_span.add_event("plan_accepted", {
+                                            "plan_id": tr.data.get("plan_id", ""),
+                                            "premium": tr.data.get("premium", 0),
+                                        })
+                                    elif decision in ["reject_plan", "hang_up"]:
+                                        turn_span.add_event("plan_rejected", {
+                                            "reason": tr.data.get("reason", ""),
+                                        })
+                                # Log full buyer dialogue
+                                if "dialogue" in tr.data and tr.data["dialogue"]:
+                                    buyer_text = tr.data["dialogue"]
+                                    event_attrs["buyer_dialogue"] = buyer_text[:500]
+                                    # Also add as separate attribute for easy viewing
+                                    turn_span.set_attribute("buyer.response", buyer_text[:2000])
+                                # Log seller pitch if present
+                                if "seller_pitch" in tr.data and tr.data["seller_pitch"]:
+                                    event_attrs["seller_pitch"] = tr.data["seller_pitch"][:500]
+                            turn_span.add_event("tool_result", event_attrs)
+
+                if args.verbose:
+                    print(f"\nTurn {turn}:")
+                    if message:
+                        print(f"  💬 {message[:200]}{'...' if len(message) > 200 else ''}")
+                    for tc in tool_calls:
+                        print(f"  → {tc.tool_name}({tc.arguments})")
+                    if result:
+                        for tr in result.tool_results:
+                            status = "OK" if tr.success else "FAIL"
+                            print(f"  ← [{status}] {tr.data or tr.error}")
+                            if tr.success and tr.data:
+                                if "seller_pitch" in tr.data and tr.data["seller_pitch"]:
+                                    print(f"  🗣️  Seller: \"{tr.data['seller_pitch']}\"")
+                                if "dialogue" in tr.data and tr.data["dialogue"]:
+                                    print(f"  📞 Buyer: \"{tr.data['dialogue']}\"")
+
+                if result and result.terminated:
+                    print(f"\nEpisode terminated: {result.termination_reason}")
+                    if turn_span:
+                        turn_span.add_event("episode_terminated", {"reason": result.termination_reason})
+                    break
+
+                if result:
+                    obs_dict = result.observation
+                    obs_dict["last_tool_results"] = [tr.to_dict() for tr in result.tool_results]
+
+        # Return turn count for final metrics
+        return turn
+
+    # Run with episode span as the root (all child spans will be nested under it)
+    if tracer:
+        with tracer.start_as_current_span("episode") as episode_span:
+            turn_count = run_episode_with_tracing(episode_span)
+            final = orchestrator.get_final_result()
+            # Add final metrics to episode span
+            episode_span.set_attribute("episode.total_turns", turn_count)
+            episode_span.set_attribute("episode.final_score", final.final_score)
+            episode_span.set_attribute("episode.total_accepts", final.metrics.get("accepted_offers", 0))
+            episode_span.set_attribute("episode.total_rejects", final.metrics.get("rejected_offers", 0))
+            episode_span.set_attribute("episode.total_calls", final.metrics.get("total_calls", 0))
+            episode_span.set_attribute("episode.dnc_violations", final.metrics.get("dnc_violations", 0))
+            episode_span.add_event("episode_complete", {
+                "final_score": final.final_score,
+                "accepts": final.metrics.get("accepted_offers", 0),
+                "rejects": final.metrics.get("rejected_offers", 0),
+            })
+    else:
+        run_episode_with_tracing(None)
+        final = orchestrator.get_final_result()
     print("\n" + "=" * 60)
     print("Episode Complete")
     print("=" * 60)
@@ -430,6 +606,12 @@ def run_episode_command(args: argparse.Namespace) -> int:
     print("  - summary.json")
     if args.verbose:
         print("  - traces.json")
+
+    # Shutdown telemetry (flushes traces)
+    if telemetry_manager:
+        print("\nFlushing telemetry traces...")
+        telemetry_manager.shutdown()
+        print("Telemetry: traces sent to Grafana")
 
     return 0
 
