@@ -367,6 +367,7 @@ class Persona:
     call_count: int = 0
     last_contact_day: Optional[int] = None
     on_dnc_list: bool = False
+    converted: bool = False  # True once the lead has accepted a plan
 
     def to_public_dict(self) -> dict[str, Any]:
         """Convert to dictionary with only public fields."""
@@ -387,6 +388,7 @@ class Persona:
             "call_count": self.call_count,
             "last_contact_day": self.last_contact_day,
             "on_dnc_list": self.on_dnc_list,
+            "converted": self.converted,
         }
 
     def to_full_dict(self) -> dict[str, Any]:

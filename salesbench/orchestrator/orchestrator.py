@@ -133,6 +133,10 @@ class Orchestrator:
             buyer_model_config=buyer_cfg,
         )
 
+        # Guardrails for benchmark-clean trajectories
+        self._last_search_signature: Optional[tuple[tuple[str, Any], ...]] = None
+        self._last_search_turn: int = 0
+
     @property
     def is_terminated(self) -> bool:
         """Check if the episode is terminated."""
@@ -186,6 +190,10 @@ class Orchestrator:
         # Set episode context on environment for buyer history
         self._env.set_episode_context(self._episode_context)
 
+        # Reset guardrails
+        self._last_search_signature = None
+        self._last_search_turn = 0
+
         return observation
 
     def step(self, tool_calls: list[ToolCall], seller_message: Optional[str] = None) -> TurnResult:
@@ -214,8 +222,49 @@ class Orchestrator:
 
         # Execute tool calls
         tool_results = []
+        proposal_executed = False
         for tc in tool_calls:
             try:
+                # --- Guardrail: require a spoken seller message when proposing a plan ---
+                if tc.tool_name == "calling.propose_plan" and not (
+                    seller_message and seller_message.strip()
+                ):
+                    tool_results.append(
+                        ToolResult(
+                            call_id=tc.call_id,
+                            success=False,
+                            error="Protocol violation: calling.propose_plan requires a seller message in the same turn.",
+                        )
+                    )
+                    continue
+
+                # --- Guardrail: at most one propose_plan per turn ---
+                if tc.tool_name == "calling.propose_plan" and proposal_executed:
+                    tool_results.append(
+                        ToolResult(
+                            call_id=tc.call_id,
+                            success=False,
+                            error="Protocol violation: only one calling.propose_plan is allowed per turn.",
+                        )
+                    )
+                    continue
+
+                # --- Guardrail: block duplicate search_leads on consecutive turns ---
+                if tc.tool_name == "crm.search_leads":
+                    sig = tuple(sorted((tc.arguments or {}).items()))
+                    if (
+                        self._last_search_signature == sig
+                        and self._last_search_turn == self._termination_checker.turn_count - 1
+                    ):
+                        tool_results.append(
+                            ToolResult(
+                                call_id=tc.call_id,
+                                success=False,
+                                error="Duplicate crm.search_leads on consecutive turns; change filters or take another action.",
+                            )
+                        )
+                        continue
+
                 # Check budget before execution
                 self._budget_tracker.enforce_tool_call()
 
@@ -228,6 +277,24 @@ class Orchestrator:
 
                 # Record usage
                 self._budget_tracker.record_tool_call()
+
+                # Update duplicate-search tracking on successful searches
+                if tc.tool_name == "crm.search_leads" and result.success:
+                    self._last_search_signature = tuple(sorted((tc.arguments or {}).items()))
+                    self._last_search_turn = self._termination_checker.turn_count
+
+                # Mark that we executed a proposal (even if rejected/accepted)
+                if tc.tool_name == "calling.propose_plan":
+                    proposal_executed = True
+
+                # --- Guardrail: stop executing remaining tools after call ends ---
+                # Prevents noisy "No active call" errors from extra tool calls in same turn.
+                if tc.tool_name == "calling.propose_plan" and result.success:
+                    data = result.data or {}
+                    if data.get("call_ended"):
+                        break
+                if tc.tool_name == "calling.end_call" and result.success:
+                    break
 
             except BudgetExceeded as e:
                 tool_results.append(

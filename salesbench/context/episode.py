@@ -465,6 +465,16 @@ class EpisodeContext:
             buyer_manager = self._get_buyer_manager(self._current_lead_id)
             buyer_manager.add_dialogue("seller", content)
 
+    def get_last_seller_utterance(self, lead_id: str) -> Optional[str]:
+        """Return the most recent seller-spoken utterance for a lead, if any."""
+        convo = self._lead_conversations.get(lead_id)
+        if not convo or not convo.dialogue_only:
+            return None
+        for role, text in reversed(convo.dialogue_only):
+            if role == "seller" and text:
+                return text
+        return None
+
     def record_tool_result(
         self,
         tool_name: str,
@@ -591,6 +601,37 @@ class EpisodeContext:
             # Add to buyer manager for this lead
             buyer_manager = self._get_buyer_manager(lead_id)
             buyer_manager.add_dialogue("buyer", dialogue)
+
+    def record_buyer_message(self, lead_id: str, dialogue: str) -> None:
+        """Record a buyer's conversational message (NOT a decision).
+
+        This should be used for normal back-and-forth dialogue during a call,
+        when the buyer is responding naturally but has not accepted/rejected/ended.
+
+        IMPORTANT: This does NOT update AnchoredState decisions and must NOT
+        end calls or change lead availability.
+        """
+        if not dialogue:
+            return
+
+        self._message_counter += 1
+
+        lead_convo = self._get_lead_conversation(lead_id)
+
+        # Store as a normal user message in the per-lead conversation
+        lead_convo.messages.append(
+            Message(
+                role="user",
+                content=f'Buyer: "{dialogue}"',
+                priority=self.PRIORITY_SELLER_MESSAGE,
+                timestamp=self._message_counter,
+            )
+        )
+
+        # Dialogue-only + buyer manager (for per-lead history given back to buyer simulator)
+        lead_convo.dialogue_only.append(("buyer", dialogue))
+        buyer_manager = self._get_buyer_manager(lead_id)
+        buyer_manager.add_dialogue("buyer", dialogue)
 
     def record_call_start(self, lead_id: str, lead_name: str = "Unknown") -> None:
         """Record the start of a call with a lead.

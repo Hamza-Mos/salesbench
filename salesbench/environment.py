@@ -19,9 +19,9 @@ import logging
 import os
 from typing import Optional
 
-import verifiers as vf
 from datasets import Dataset
 
+import verifiers as vf
 from salesbench.core.config import BudgetConfig, SalesBenchConfig, ScoringConfig
 from salesbench.envs.sales_mvp.env import SalesEnv
 from salesbench.envs.sales_mvp.verifiers.scoring import (
@@ -175,7 +175,6 @@ async def calling_propose_plan(
     coverage_amount: float,
     next_step: str,
     term_years: int = None,
-    pitch: str = None,
 ) -> str:
     """Propose an insurance plan to the buyer and get their response.
 
@@ -185,8 +184,6 @@ async def calling_propose_plan(
         coverage_amount: Coverage amount.
         next_step: Proposed next step (schedule_followup, request_info, close_now).
         term_years: Term length for TERM plans.
-        pitch: Sales pitch to deliver.
-
     Returns:
         JSON string with buyer's decision and response.
     """
@@ -196,7 +193,6 @@ async def calling_propose_plan(
         coverage_amount=coverage_amount,
         next_step=next_step,
         term_years=term_years,
-        pitch=pitch,
     )
     return json.dumps(result.data if result.success else {"error": result.error})
 

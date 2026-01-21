@@ -106,6 +106,15 @@ class CallingTools:
                 data={"dnc_violation": True},
             )
 
+        # Check already converted
+        if lead.converted:
+            return ToolResult(
+                call_id="",
+                success=False,
+                error=f"Lead {lead_id} already converted (accepted previously).",
+                data={"converted": True},
+            )
+
         # Create call session
         call_id = generate_call_id()
         session = CallSession(
@@ -231,12 +240,15 @@ class CallingTools:
 
         # Get negotiation history for this lead from episode context
         negotiation_history = None
+        seller_pitch = None
         if self._episode_context:
             negotiation_history = self._episode_context.get_buyer_view(str(session.lead_id))
+            seller_pitch = self._episode_context.get_last_seller_utterance(str(session.lead_id))
 
-        # Note: pitch is no longer passed as a tool argument - the seller's message
-        # is now separate from tool calls. Pass None for backwards compatibility.
-        buyer_response = self._buyer_simulator(lead, offer, session, None, negotiation_history)
+        # Condition the buyer's decision on what the seller actually said most recently.
+        buyer_response = self._buyer_simulator(
+            lead, offer, session, seller_pitch, negotiation_history
+        )
 
         # Record offer and response
         session.offers_presented.append(offer)
@@ -260,6 +272,8 @@ class CallingTools:
             self.state.record_call_outcome(BuyerDecision.ACCEPT_PLAN)
             result_data["message"] = "Buyer ACCEPTED the plan! Call ended successfully."
             result_data["call_ended"] = True
+            # Mark lead converted to prevent future calls/search results
+            lead.converted = True
             # Auto-end call on acceptance
             self._finalize_call(session)
 

@@ -32,12 +32,26 @@ from salesbench.core.types import (
     ToolCall,
     ToolResult,
 )
-from salesbench.environment import (
-    SalesBenchToolEnv,
-    create_salesbench_dataset,
-    load_environment,
-)
 from salesbench.envs.sales_mvp.env import SalesEnv
+
+# Optional: verifiers-compatible environment is only available when optional
+# dependencies (e.g. `verifiers`, `datasets`) are installed.
+try:
+    from salesbench.environment import (
+        SalesBenchToolEnv,
+        create_salesbench_dataset,
+        load_environment,
+    )
+except Exception:  # pragma: no cover
+    SalesBenchToolEnv = None  # type: ignore[assignment]
+    create_salesbench_dataset = None  # type: ignore[assignment]
+
+    def load_environment(*args, **kwargs):  # type: ignore[no-redef]
+        raise ImportError(
+            "salesbench.load_environment requires optional dependencies. "
+            "Install the verifiers stack (e.g. `verifiers`, `datasets`) to use it."
+        )
+
 
 __version__ = "0.1.0"
 

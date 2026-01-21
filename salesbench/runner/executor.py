@@ -264,11 +264,9 @@ class EpisodeExecutor:
                     # Record buyer's response to episode context
                     lead_id = orchestrator.episode_context.current_lead_id
                     if lead_id:
-                        orchestrator.episode_context.record_buyer_decision(
+                        orchestrator.episode_context.record_buyer_message(
                             lead_id=lead_id,
-                            decision="conversation",  # Not a real decision, just dialogue
                             dialogue=buyer_conversation_response,
-                            reason="conversational response",
                         )
 
             # Verbose output with clear [SELLER] and [BUYER] labels
@@ -334,8 +332,22 @@ class EpisodeExecutor:
         from salesbench.core.types import ToolResult
 
         time_info = obs_dict.get("time", {})
-        call_info = obs_dict.get("call", {})
-        metrics = obs_dict.get("metrics", {})
+        active_call = obs_dict.get("active_call") or {}
+        stats = obs_dict.get("stats", {})
+
+        # Remaining minutes in the current business day (9:00–17:00).
+        # Default to a full day if we can't compute.
+        remaining_minutes = 8 * 60
+        try:
+            current_hour = int(time_info.get("current_hour", 9))
+            current_minute = int(time_info.get("current_minute", 0))
+            # Clamp into business hours to avoid negative values on boundary conditions.
+            current_hour = max(9, min(17, current_hour))
+            current_minute = max(0, min(59, current_minute))
+            minutes_elapsed = max(0, (current_hour - 9) * 60 + current_minute)
+            remaining_minutes = max(0, 8 * 60 - minutes_elapsed)
+        except Exception:
+            pass
 
         # Convert tool results if present
         tool_results = []
@@ -355,16 +367,16 @@ class EpisodeExecutor:
         return SellerObservation(
             current_day=time_info.get("current_day", 1),
             current_hour=time_info.get("current_hour", 9),
-            remaining_minutes=time_info.get("remaining_minutes", 480),
+            remaining_minutes=time_info.get("remaining_minutes", remaining_minutes),
             last_tool_results=tool_results,
-            in_call=call_info.get("in_call", False),
-            current_lead_id=call_info.get("current_lead_id"),
-            call_duration=call_info.get("duration", 0),
-            offers_this_call=call_info.get("offers_this_call", 0),
-            total_calls=metrics.get("total_calls", 0),
-            total_accepts=metrics.get("accepted_offers", 0),
-            total_rejects=metrics.get("rejected_offers", 0),
-            total_dnc_violations=metrics.get("dnc_violations", 0),
+            in_call=bool(obs_dict.get("has_active_call", False)),
+            current_lead_id=(active_call.get("lead_id") if active_call else None),
+            call_duration=(active_call.get("duration_minutes", 0) if active_call else 0),
+            offers_this_call=(active_call.get("offers_presented", 0) if active_call else 0),
+            total_calls=stats.get("total_calls", 0),
+            total_accepts=stats.get("accepted_offers", 0),
+            total_rejects=stats.get("rejected_offers", 0),
+            total_dnc_violations=stats.get("dnc_violations", 0),
             message=obs_dict.get("message"),
         )
 

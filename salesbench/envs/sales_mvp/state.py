@@ -139,6 +139,8 @@ class EnvironmentState:
         for lead in self.leads.values():
             if lead.on_dnc_list:
                 continue
+            if lead.converted:
+                continue
             if temperature and lead.temperature.value != temperature:
                 continue
             if min_income and lead.annual_income < min_income:
