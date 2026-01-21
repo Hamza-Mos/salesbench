@@ -17,7 +17,7 @@ from salesbench.agents.seller_base import (
     SellerConfig,
     SellerObservation,
 )
-from salesbench.core.protocol import get_all_tool_schemas
+from salesbench.core.protocol import SellerAction, get_all_tool_schemas
 from salesbench.core.types import ToolCall
 from salesbench.llm import LLMClient, create_client, detect_available_provider
 
