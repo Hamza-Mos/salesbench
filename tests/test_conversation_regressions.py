@@ -211,3 +211,58 @@ def test_orchestrator_blocks_duplicate_search_consecutive_turns(default_config):
     )
     assert r2.tool_results[0].success is False
     assert "Duplicate crm.search_leads" in (r2.tool_results[0].error or "")
+
+
+def test_llm_seller_postprocess_dedupes_and_caps_propose_plan():
+    """Regression: prevent LLM tool-call spam within a single action."""
+    from salesbench.agents.seller_llm import _postprocess_tool_calls
+    from salesbench.core.types import ToolCall
+
+    tool_calls = [
+        ToolCall(
+            tool_name="calling.propose_plan",
+            arguments={
+                "plan_id": "TERM",
+                "monthly_premium": 46,
+                "coverage_amount": 500000,
+                "next_step": "schedule_followup",
+                "term_years": 20,
+            },
+            call_id="a",
+        ),
+        # Exact duplicate (different call_id) should be removed by dedupe
+        ToolCall(
+            tool_name="calling.propose_plan",
+            arguments={
+                "plan_id": "TERM",
+                "monthly_premium": 46,
+                "coverage_amount": 500000,
+                "next_step": "schedule_followup",
+                "term_years": 20,
+            },
+            call_id="b",
+        ),
+        # Different propose_plan should also be removed by the cap (only 1 per action)
+        ToolCall(
+            tool_name="calling.propose_plan",
+            arguments={
+                "plan_id": "TERM",
+                "monthly_premium": 60,
+                "coverage_amount": 750000,
+                "next_step": "close_now",
+                "term_years": 20,
+            },
+            call_id="c",
+        ),
+        # Other duplicated tools should be de-duped but still preserved if unique
+        ToolCall(tool_name="products.quote_premium", arguments={"plan_id": "TERM", "age": 26}),
+        ToolCall(tool_name="products.quote_premium", arguments={"plan_id": "TERM", "age": 26}),
+    ]
+
+    filtered = _postprocess_tool_calls(tool_calls)
+
+    # One propose_plan total (cap) and one quote_premium total (dedupe)
+    assert [tc.tool_name for tc in filtered] == [
+        "calling.propose_plan",
+        "products.quote_premium",
+    ]

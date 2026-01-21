@@ -134,6 +134,40 @@ def _from_api_name(api_name: str) -> str:
     return api_name.replace("__", ".")
 
 
+def _postprocess_tool_calls(tool_calls: list[ToolCall]) -> list[ToolCall]:
+    """De-dupe tool calls and cap calling.propose_plan to one per action.
+
+    Some models/providers occasionally emit repeated identical tool calls in a single
+    response. This breaks benchmark conversations by spamming tool execution errors.
+    We keep the first occurrence (stable) and drop duplicates. Additionally, we allow
+    at most one `calling.propose_plan` per action, regardless of arguments.
+    """
+
+    seen: set[tuple[str, str]] = set()
+    filtered: list[ToolCall] = []
+    propose_plan_seen = False
+
+    for tc in tool_calls:
+        # Cap propose_plan to one per action (stable: keep first).
+        if tc.tool_name == "calling.propose_plan":
+            if propose_plan_seen:
+                continue
+            propose_plan_seen = True
+
+        # De-dupe exact repeats (stable: keep first).
+        try:
+            args_key = json.dumps(tc.arguments or {}, sort_keys=True, default=str)
+        except TypeError:
+            args_key = str(tc.arguments)
+        sig = (tc.tool_name, args_key)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        filtered.append(tc)
+
+    return filtered
+
+
 TOOLS_FOR_LLM = [
     {
         "type": "function",
@@ -470,7 +504,7 @@ class LLMSellerAgent(SellerAgent):
         if not tool_calls and not text_content:
             return None, self._fallback_action()
 
-        return text_content, tool_calls
+        return text_content, _postprocess_tool_calls(tool_calls)
 
     def _call_anthropic(
         self, client: LLMClient, messages: list
@@ -535,7 +569,7 @@ class LLMSellerAgent(SellerAgent):
         if not tool_calls and not text_content:
             return None, self._fallback_action()
 
-        return text_content, tool_calls
+        return text_content, _postprocess_tool_calls(tool_calls)
 
     def _call_with_json(
         self, client: LLMClient, messages: list
@@ -568,7 +602,7 @@ class LLMSellerAgent(SellerAgent):
                     )
 
             if tool_calls or message:
-                return message, tool_calls
+                return message, _postprocess_tool_calls(tool_calls)
         except (json.JSONDecodeError, KeyError):
             pass
 
@@ -684,7 +718,7 @@ class StreamingLLMSellerAgent(LLMSellerAgent):
         if not tool_calls and not text_content:
             return None, self._fallback_action()
 
-        return text_content or None, tool_calls
+        return text_content or None, _postprocess_tool_calls(tool_calls)
 
 
 class ReActSellerAgent(LLMSellerAgent):
@@ -775,7 +809,7 @@ Format your response as:
                     )
 
             if tool_calls or message:
-                return message, tool_calls
+                return message, _postprocess_tool_calls(tool_calls)
         except (json.JSONDecodeError, KeyError):
             pass
 
