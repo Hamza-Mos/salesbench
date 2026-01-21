@@ -35,11 +35,11 @@ SELLER_TOOLS = frozenset(
 @dataclass
 class SellerAction:
     """Validated seller action.
-    
+
     Can contain:
     - message: Free-form text to send to the buyer (the actual conversation)
     - tool_calls: Analytical/operational tools (CRM, products, etc.)
-    
+
     The seller can output both a message AND tool calls in the same turn.
     Tool calls like propose_plan are purely analytical and don't affect the conversation.
     """

@@ -10,6 +10,69 @@ from typing import Any, Optional
 
 
 @dataclass
+class TokenUsage:
+    """Tracks token usage for cost estimation.
+
+    Attributes:
+        seller_input_tokens: Input tokens used by seller LLM.
+        seller_output_tokens: Output tokens used by seller LLM.
+        buyer_input_tokens: Input tokens used by buyer LLM.
+        buyer_output_tokens: Output tokens used by buyer LLM.
+    """
+
+    seller_input_tokens: int = 0
+    seller_output_tokens: int = 0
+    buyer_input_tokens: int = 0
+    buyer_output_tokens: int = 0
+
+    @property
+    def total_input_tokens(self) -> int:
+        """Total input tokens across all LLMs."""
+        return self.seller_input_tokens + self.buyer_input_tokens
+
+    @property
+    def total_output_tokens(self) -> int:
+        """Total output tokens across all LLMs."""
+        return self.seller_output_tokens + self.buyer_output_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        """Total tokens (input + output)."""
+        return self.total_input_tokens + self.total_output_tokens
+
+    def add_seller_usage(self, input_tokens: int, output_tokens: int) -> None:
+        """Add seller LLM usage."""
+        self.seller_input_tokens += input_tokens
+        self.seller_output_tokens += output_tokens
+
+    def add_buyer_usage(self, input_tokens: int, output_tokens: int) -> None:
+        """Add buyer LLM usage."""
+        self.buyer_input_tokens += input_tokens
+        self.buyer_output_tokens += output_tokens
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "seller_input_tokens": self.seller_input_tokens,
+            "seller_output_tokens": self.seller_output_tokens,
+            "buyer_input_tokens": self.buyer_input_tokens,
+            "buyer_output_tokens": self.buyer_output_tokens,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+    def __add__(self, other: "TokenUsage") -> "TokenUsage":
+        """Add two TokenUsage instances."""
+        return TokenUsage(
+            seller_input_tokens=self.seller_input_tokens + other.seller_input_tokens,
+            seller_output_tokens=self.seller_output_tokens + other.seller_output_tokens,
+            buyer_input_tokens=self.buyer_input_tokens + other.buyer_input_tokens,
+            buyer_output_tokens=self.buyer_output_tokens + other.buyer_output_tokens,
+        )
+
+
+@dataclass
 class EpisodeResult:
     """Result of a single episode execution.
 
@@ -31,6 +94,7 @@ class EpisodeResult:
         ended_at: When episode ended.
         error: Error message if failed.
         metrics: Full metrics dict from orchestrator.
+        token_usage: Token usage for cost estimation.
     """
 
     episode_id: str
@@ -50,6 +114,8 @@ class EpisodeResult:
     ended_at: Optional[datetime] = None
     error: Optional[str] = None
     metrics: dict = field(default_factory=dict)
+    trajectory: list[dict] = field(default_factory=list)  # Full conversation history
+    token_usage: TokenUsage = field(default_factory=TokenUsage)
 
     @property
     def succeeded(self) -> bool:
@@ -90,6 +156,8 @@ class EpisodeResult:
             "error": self.error,
             "acceptance_rate": self.acceptance_rate,
             "metrics": self.metrics,
+            "trajectory": self.trajectory,
+            "token_usage": self.token_usage.to_dict(),
         }
 
 
@@ -208,6 +276,11 @@ class BenchmarkResult:
         # Count episodes with at least one accept
         c = sum(1 for e in completed if e.has_accepts)
 
+        # Aggregate token usage across all episodes
+        total_tokens = TokenUsage()
+        for e in self.episode_results:
+            total_tokens = total_tokens + e.token_usage
+
         metrics = {
             "n_episodes": n,
             "completed_episodes": self.completed_episodes,
@@ -232,6 +305,8 @@ class BenchmarkResult:
             # Timing
             "total_duration_seconds": sum(durations),
             "mean_episode_duration": statistics.mean(durations),
+            # Token usage
+            "total_token_usage": total_tokens.to_dict(),
         }
 
         self.aggregate_metrics = metrics

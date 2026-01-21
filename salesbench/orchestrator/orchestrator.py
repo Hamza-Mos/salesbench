@@ -11,10 +11,12 @@ The orchestrator:
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from salesbench.context.episode import EpisodeContext
 from salesbench.core.config import SalesBenchConfig
 from salesbench.core.errors import BudgetExceeded, EpisodeTerminated
 from salesbench.core.types import ToolCall, ToolResult
 from salesbench.envs.sales_mvp.env import SalesEnv
+from salesbench.models import ModelConfig, ModelSpec
 from salesbench.orchestrator.budgets import BudgetTracker
 from salesbench.orchestrator.termination import TerminationChecker, TerminationStatus
 
@@ -86,15 +88,21 @@ class Orchestrator:
         self,
         config: Optional[SalesBenchConfig] = None,
         scorer: Optional[Callable[["Orchestrator"], float]] = None,
+        seller_model_spec: Optional[ModelSpec] = None,
+        buyer_model_spec: Optional[ModelSpec] = None,
     ):
         """Initialize the orchestrator.
 
         Args:
             config: Configuration for the environment.
             scorer: Optional custom scoring function.
+            seller_model_spec: Model specification for seller (used for context management).
+            buyer_model_spec: Model specification for buyer (used for context management).
         """
         self.config = config or SalesBenchConfig()
         self._scorer = scorer
+        self._seller_model_spec = seller_model_spec
+        self._buyer_model_spec = buyer_model_spec
 
         # Create environment
         self._env = SalesEnv(self.config)
@@ -115,6 +123,16 @@ class Orchestrator:
         self._history: list[dict[str, Any]] = []
         self._cumulative_score = 0.0
 
+        # Get model configs for context management
+        seller_cfg = seller_model_spec.config if seller_model_spec else None
+        buyer_cfg = buyer_model_spec.config if buyer_model_spec else None
+
+        # Episode context for conversation management with model-aware compression
+        self._episode_context = EpisodeContext(
+            seller_model_config=seller_cfg,
+            buyer_model_config=buyer_cfg,
+        )
+
     @property
     def is_terminated(self) -> bool:
         """Check if the episode is terminated."""
@@ -129,6 +147,11 @@ class Orchestrator:
     def turn_count(self) -> int:
         """Get the current turn count."""
         return self._termination_checker.turn_count
+
+    @property
+    def episode_context(self) -> EpisodeContext:
+        """Get the episode context for conversation management."""
+        return self._episode_context
 
     def reset(self) -> dict[str, Any]:
         """Reset the orchestrator and environment.
@@ -149,6 +172,19 @@ class Orchestrator:
         self._termination_status = None
         self._history = []
         self._cumulative_score = 0.0
+
+        # Get model configs for context management
+        seller_cfg = self._seller_model_spec.config if self._seller_model_spec else None
+        buyer_cfg = self._buyer_model_spec.config if self._buyer_model_spec else None
+
+        # Reset episode context for new episode with model-aware compression
+        self._episode_context = EpisodeContext(
+            seller_model_config=seller_cfg,
+            buyer_model_config=buyer_cfg,
+        )
+
+        # Set episode context on environment for buyer history
+        self._env.set_episode_context(self._episode_context)
 
         return observation
 
@@ -185,6 +221,9 @@ class Orchestrator:
                 # Execute tool
                 result = self._env.execute_tool(tc)
                 tool_results.append(result)
+
+                # Record to episode context
+                self._record_tool_to_context(tc, result)
 
                 # Record usage
                 self._budget_tracker.record_tool_call()
@@ -296,6 +335,89 @@ class Orchestrator:
                 score += scoring.dnc_penalty
 
         return score
+
+    def _record_tool_to_context(self, tool_call: ToolCall, result: ToolResult) -> None:
+        """Record a tool call and result to the episode context.
+
+        Inspects the tool call and result to determine what type of event
+        occurred and records it appropriately to the episode context.
+
+        Args:
+            tool_call: The tool call that was executed.
+            result: The result of the tool execution.
+        """
+        tool_name = tool_call.tool_name
+        data = result.data or {}
+
+        # Handle call start
+        if tool_name == "calling.start_call" and result.success:
+            lead_id = data.get("lead_id")
+            if lead_id:
+                self._episode_context.record_call_start(lead_id)
+            self._episode_context.record_tool_result(tool_name, data, lead_id=lead_id)
+            return
+
+        # Handle propose_plan - this is a key event
+        if tool_name == "calling.propose_plan" and result.success:
+            lead_id = self._episode_context.current_lead_id
+            offer = data.get("offer_presented", {})
+            decision = data.get("decision")
+            dialogue = data.get("dialogue", "")
+            reason = data.get("reason", "")
+
+            # Record the offer if present
+            if offer and lead_id:
+                from salesbench.core.types import NextStep, PlanOffer, PlanType
+
+                try:
+                    plan_offer = PlanOffer(
+                        plan_id=PlanType(offer.get("plan_id", "TERM")),
+                        monthly_premium=offer.get("monthly_premium", 0),
+                        coverage_amount=offer.get("coverage_amount", 0),
+                        next_step=NextStep(offer.get("next_step", "close_now")),
+                        term_years=offer.get("term_years"),
+                    )
+                    self._episode_context.record_offer(lead_id, plan_offer)
+                except (ValueError, KeyError):
+                    pass  # Skip if offer data is malformed
+
+            # Record the buyer's decision
+            if decision and lead_id:
+                self._episode_context.record_buyer_decision(lead_id, decision, dialogue, reason)
+
+            # Check if call ended (accept or end_call decisions end the call)
+            if data.get("call_ended") and lead_id:
+                reason_str = data.get("message", "Call ended")
+                self._episode_context.record_call_end(lead_id, reason_str)
+
+            return
+
+        # Handle end_call
+        if tool_name == "calling.end_call" and result.success:
+            lead_id = data.get("lead_id") or self._episode_context.current_lead_id
+            if lead_id:
+                reason_str = data.get("reason", "Seller ended call")
+                self._episode_context.record_call_end(lead_id, reason_str)
+            self._episode_context.record_tool_result(tool_name, data, lead_id=lead_id)
+            return
+
+        # For other tools, just record the result
+        lead_id = data.get("lead_id") or self._episode_context.current_lead_id
+        self._episode_context.record_tool_result(tool_name, data, lead_id=lead_id)
+
+    def record_seller_message(self, message: str) -> None:
+        """Record a seller's spoken message to the episode context.
+
+        This should be called by the executor when the seller agent
+        produces a message to be spoken to the buyer.
+
+        Args:
+            message: The message the seller is speaking.
+        """
+        self._episode_context.record_seller_action(
+            content=message,
+            is_spoken_message=True,
+        )
 
     def get_final_result(self) -> EpisodeResult:
         """Get the final result of the episode.

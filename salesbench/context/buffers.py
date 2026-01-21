@@ -220,21 +220,30 @@ class KeyEventBuffer(MessageBuffer):
     def token_count(self) -> int:
         return sum(m.token_estimate() for m in self.get_messages())
 
-    def compact(self, summarizer=None) -> None:
+    def compact(self, summarizer=None, force: bool = False) -> None:
         """Compact old messages into a summary.
 
         Args:
             summarizer: Optional callable that takes messages and returns summary.
+            force: If True, compact even if message count is below threshold.
+                   Used when token count exceeds limit.
         """
-        if len(self._messages) <= self.max_messages // 2:
+        # Check if compaction is needed
+        # Compact if: forced (token overflow) OR message count exceeds half
+        needs_compact = force or len(self._messages) > self.max_messages // 2
+        if not needs_compact:
             return
 
         # Separate key events from regular messages
         key_events = [m for m in self._messages if m.priority >= self.key_event_priority]
         regular = [m for m in self._messages if m.priority < self.key_event_priority]
 
-        # Keep recent regular messages
-        keep_count = self.max_messages // 4
+        # If forced (token overflow), be more aggressive - keep fewer messages
+        if force:
+            keep_count = max(10, self.max_messages // 8)  # Keep ~12-25 recent messages
+        else:
+            keep_count = self.max_messages // 4
+
         to_compact = regular[:-keep_count] if len(regular) > keep_count else []
         to_keep = regular[-keep_count:] if len(regular) > keep_count else regular
 
@@ -247,3 +256,114 @@ class KeyEventBuffer(MessageBuffer):
 
             self.add_summary(summary)
             self._messages = key_events + to_keep
+
+
+class SimpleCompactBuffer(MessageBuffer):
+    """Buffer with observation masking (not summarization).
+
+    Strategy (based on JetBrains observation masking pattern):
+    1. Key events (priority >= 10): NEVER removed
+    2. Recent messages (last N): NEVER removed
+    3. Older tool results: MASKED to preserve key IDs only
+    """
+
+    def __init__(
+        self,
+        max_tokens: int = 100_000,
+        keep_recent: int = 15,
+        key_event_priority: int = 10,
+    ):
+        self.max_tokens = max_tokens
+        self.keep_recent = keep_recent
+        self.key_event_priority = key_event_priority
+        self._messages: List[Message] = []
+        self._counter = 0
+
+    def add(self, message: Message) -> None:
+        message.timestamp = self._counter
+        self._counter += 1
+        self._messages.append(message)
+
+    def add_key_event(self, content: str, role: str = "system") -> None:
+        """Add a key event that should always be preserved."""
+        self._messages.append(
+            Message(
+                role=role,
+                content=content,
+                priority=self.key_event_priority,
+                timestamp=self._counter,
+            )
+        )
+        self._counter += 1
+
+    def compact_if_needed(self, trigger_tokens: int) -> None:
+        """Compact when exceeding trigger_tokens using observation masking."""
+        if self.token_count() <= trigger_tokens:
+            return
+
+        print(f"  [Context] Compacting: {self.token_count():,} > {trigger_tokens:,} tokens")
+
+        # Separate key events from regular messages
+        key_events = [m for m in self._messages if m.priority >= self.key_event_priority]
+
+        # Get recent messages (non-key events)
+        recent_idx = max(0, len(self._messages) - self.keep_recent)
+        recent = [m for m in self._messages[recent_idx:] if m.priority < self.key_event_priority]
+        older = [m for m in self._messages[:recent_idx] if m.priority < self.key_event_priority]
+
+        # Mask older tool results instead of summarizing
+        masked = []
+        for msg in older:
+            tool_name = msg.metadata.get("tool_name")
+            if tool_name:
+                masked.append(
+                    Message(
+                        role=msg.role,
+                        content=self._mask_tool_result(tool_name, msg.content),
+                        priority=1,
+                        timestamp=msg.timestamp,
+                        metadata={"masked": True, "original_tool": tool_name},
+                    )
+                )
+            # Drop non-tool older messages entirely
+
+        self._messages = sorted(key_events + masked + recent, key=lambda m: m.timestamp)
+        print(f"  [Context] After: {self.token_count():,} tokens")
+
+    def _mask_tool_result(self, tool_name: str, content: str) -> str:
+        """Mask tool result - preserve key identifiers only."""
+        if tool_name == "crm.search_leads":
+            try:
+                import json
+                import re
+
+                match = re.search(r"\{.*\}", content, re.DOTALL)
+                if match:
+                    data = json.loads(match.group())
+                    leads = data.get("leads", [])
+                    ids = [l.get("lead_id", "?") for l in leads[:5]]
+                    more = f"... (+{len(leads)-5})" if len(leads) > 5 else ""
+                    return f"[crm.search_leads -> {len(leads)} leads: {', '.join(ids)}{more}]"
+            except Exception:
+                pass
+            return "[crm.search_leads -> results]"
+        elif tool_name == "crm.get_lead":
+            return "[crm.get_lead -> details retrieved]"
+        elif tool_name == "calling.start_call":
+            return "[calling.start_call -> connected]"
+        elif tool_name == "products.quote_premium":
+            return "[products.quote_premium -> quote generated]"
+        return f"[{tool_name} -> completed]"
+
+    def get_messages(self) -> List[Message]:
+        return list(self._messages)
+
+    def token_count(self) -> int:
+        return sum(m.token_estimate() for m in self._messages)
+
+    def to_api_messages(self) -> List[dict[str, Any]]:
+        return [m.to_dict() for m in self._messages]
+
+    def clear(self) -> None:
+        self._messages.clear()
+        self._counter = 0

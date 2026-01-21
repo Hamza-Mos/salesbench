@@ -6,7 +6,7 @@ This is the central environment class that:
 - Manages the episode lifecycle
 """
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from salesbench.core.config import SalesBenchConfig
 from salesbench.core.errors import (
@@ -26,6 +26,9 @@ from salesbench.envs.sales_mvp.tools.calendar import CalendarTools
 from salesbench.envs.sales_mvp.tools.calling import BuyerSimulatorFn, CallingTools
 from salesbench.envs.sales_mvp.tools.crm import CRMTools
 from salesbench.envs.sales_mvp.tools.products import ProductTools
+
+if TYPE_CHECKING:
+    from salesbench.context.episode import EpisodeContext
 
 
 class SalesEnv:
@@ -71,6 +74,9 @@ class SalesEnv:
         # Store buyer simulator to preserve across resets
         self._buyer_simulator: Optional[BuyerSimulatorFn] = None
 
+        # Store episode context for conversation history
+        self._episode_context: Optional["EpisodeContext"] = None
+
     @property
     def state(self) -> EnvironmentState:
         """Get the current state."""
@@ -107,6 +113,10 @@ class SalesEnv:
         if self._buyer_simulator:
             self._calling_tools.set_buyer_simulator(self._buyer_simulator)
 
+        # Re-apply episode context if it was set
+        if self._episode_context:
+            self._calling_tools.set_episode_context(self._episode_context)
+
         # Generate leads
         self._persona_generator.reset()
         leads = self._persona_generator.generate_batch(self.config.num_leads)
@@ -127,6 +137,19 @@ class SalesEnv:
         # Store at env level to preserve across resets
         self._buyer_simulator = simulator
         self._calling_tools.set_buyer_simulator(simulator)
+
+    def set_episode_context(self, context: "EpisodeContext") -> None:
+        """Set the episode context for conversation history.
+
+        The episode context is used to provide buyers with their
+        negotiation history with the seller.
+
+        Args:
+            context: The episode context to use.
+        """
+        # Store at env level to preserve across resets
+        self._episode_context = context
+        self._calling_tools.set_episode_context(context)
 
     def execute_tool(self, tool_call: ToolCall) -> ToolResult:
         """Execute a single tool call.

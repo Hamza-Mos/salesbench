@@ -24,12 +24,16 @@ from salesbench.core.types import (
 )
 
 if TYPE_CHECKING:
+    from salesbench.context.episode import EpisodeContext
     from salesbench.envs.sales_mvp.personas import Persona
     from salesbench.envs.sales_mvp.state import EnvironmentState
 
 
-# Type for buyer simulator callback (persona, offer, session, seller_pitch)
-BuyerSimulatorFn = Callable[["Persona", PlanOffer, "CallSession", Optional[str]], BuyerResponseData]
+# Type for buyer simulator callback (persona, offer, session, seller_pitch, negotiation_history)
+BuyerSimulatorFn = Callable[
+    ["Persona", PlanOffer, "CallSession", Optional[str], Optional[str]],
+    BuyerResponseData,
+]
 
 
 class CallingTools:
@@ -44,10 +48,19 @@ class CallingTools:
         self.state = state
         self.budget = budget
         self._buyer_simulator = buyer_simulator
+        self._episode_context: Optional["EpisodeContext"] = None
 
     def set_buyer_simulator(self, simulator: BuyerSimulatorFn) -> None:
         """Set the buyer simulator callback."""
         self._buyer_simulator = simulator
+
+    def set_episode_context(self, context: "EpisodeContext") -> None:
+        """Set the episode context for conversation history.
+
+        Args:
+            context: The episode context to use for buyer history.
+        """
+        self._episode_context = context
 
     def start_call(self, lead_id: str) -> ToolResult:
         """Start a call with a lead.
@@ -215,9 +228,15 @@ class CallingTools:
                 success=False,
                 error="Buyer simulator not configured. LLM buyer is required.",
             )
+
+        # Get negotiation history for this lead from episode context
+        negotiation_history = None
+        if self._episode_context:
+            negotiation_history = self._episode_context.get_buyer_view(str(session.lead_id))
+
         # Note: pitch is no longer passed as a tool argument - the seller's message
         # is now separate from tool calls. Pass None for backwards compatibility.
-        buyer_response = self._buyer_simulator(lead, offer, session, None)
+        buyer_response = self._buyer_simulator(lead, offer, session, None, negotiation_history)
 
         # Record offer and response
         session.offers_presented.append(offer)

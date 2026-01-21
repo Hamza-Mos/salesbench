@@ -1,10 +1,13 @@
-"""CLI entrypoint for SalesBench debug tools.
+"""CLI entrypoint for SalesBench.
 
 Commands:
+- run-benchmark: Run benchmark with one or more models
+- run-episode: Run a single episode (for debugging)
+- list-models: List known models and providers
+- list-domains: List available sales domains
 - seed-leads: Generate and display personas from a seed
-- run-episode: Run a single episode with an LLM agent
-- run-benchmark: Run N episodes in parallel with integrations
 - inspect-products: Display product catalog
+- leaderboard: Launch the leaderboard UI
 """
 
 import argparse
@@ -185,21 +188,6 @@ def run_episode_command(args: argparse.Namespace) -> int:
     Returns:
         Exit code.
     """
-    from salesbench.llm import detect_available_provider
-
-    # Check for any LLM provider
-    provider = detect_available_provider()
-    if not provider:
-        print("ERROR: No LLM provider API key found.")
-        print("Set ONE of these environment variables in .env or shell:")
-        print("  - OPENAI_API_KEY")
-        print("  - ANTHROPIC_API_KEY")
-        print("  - OPENROUTER_API_KEY")
-        print("  - XAI_API_KEY")
-        print("  - TOGETHER_API_KEY")
-        print("  - GOOGLE_API_KEY")
-        return 1
-
     # Initialize telemetry if enabled
     telemetry_manager = None
     try:
@@ -221,37 +209,63 @@ def run_episode_command(args: argparse.Namespace) -> int:
     from salesbench.agents.buyer_llm import create_buyer_simulator
     from salesbench.agents.seller_llm import LLMSellerAgent
     from salesbench.core.config import SalesBenchConfig
+    from salesbench.llm import get_api_key_for_provider
+    from salesbench.models import DEFAULT_BUYER_MODEL, parse_model_spec
     from salesbench.orchestrator.orchestrator import Orchestrator
+
+    # Parse seller model (CLI arg > env var)
+    seller_model_str = args.seller_model or os.environ.get("SALESBENCH_SELLER_MODEL")
+    if not seller_model_str:
+        print("ERROR: No seller model specified.")
+        print("Use --seller-model provider/model (e.g., --seller-model openai/gpt-4o)")
+        return 1
+
+    try:
+        seller_spec = parse_model_spec(seller_model_str)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        return 1
+
+    # Parse buyer model (CLI arg > env var > default)
+    buyer_model_str = (
+        args.buyer_model or os.environ.get("SALESBENCH_BUYER_MODEL") or DEFAULT_BUYER_MODEL
+    )
+    try:
+        buyer_spec = parse_model_spec(buyer_model_str)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        return 1
+
+    # Check API keys
+    if not get_api_key_for_provider(seller_spec.provider):
+        print(f"ERROR: No API key found for seller provider '{seller_spec.provider}'.")
+        return 1
+
+    if not get_api_key_for_provider(buyer_spec.provider):
+        print(f"ERROR: No API key found for buyer provider '{buyer_spec.provider}'.")
+        return 1
 
     config = SalesBenchConfig(seed=args.seed, num_leads=args.leads)
     orchestrator = Orchestrator(config)
 
-    # Set up LLM buyer simulator (CLI arg > env var > default)
-    buyer_model = args.buyer_model or os.environ.get("SALESBENCH_BUYER_MODEL")
-    buyer_temp = float(os.environ.get("SALESBENCH_BUYER_TEMPERATURE", "0.3"))
+    # Set up LLM buyer simulator with explicit provider
+    buyer_temp = float(os.environ.get("SALESBENCH_BUYER_TEMPERATURE", "0.0"))
     buyer_simulator = create_buyer_simulator(
-        provider=provider,
-        model=buyer_model,
+        provider=buyer_spec.provider,
+        model=buyer_spec.model,
         temperature=buyer_temp,
     )
     orchestrator.set_buyer_simulator(buyer_simulator)
 
-    # Set up LLM seller agent (CLI arg > env var > default)
-    seller_model = args.seller_model or os.environ.get("SALESBENCH_SELLER_MODEL")
+    # Set up LLM seller agent with explicit provider
     seller_agent = LLMSellerAgent(
-        provider=provider,
-        model=seller_model,
+        provider=seller_spec.provider,
+        model=seller_spec.model,
     )
 
-    # Get actual model names for display
-    from salesbench.llm import DEFAULT_MODELS
-
-    display_buyer_model = buyer_model or DEFAULT_MODELS.get(provider, "default")
-    display_seller_model = seller_model or DEFAULT_MODELS.get(provider, "default")
-
     print(f"Starting episode with seed {args.seed}, {args.leads} leads")
-    print(f"Provider: {provider}")
-    print(f"Buyer model: {display_buyer_model}, Seller model: {display_seller_model}")
+    print(f"Seller: {seller_spec}")
+    print(f"Buyer: {buyer_spec}")
     print("-" * 60)
 
     # Get telemetry span manager if available
@@ -324,6 +338,10 @@ def run_episode_command(args: argparse.Namespace) -> int:
         except ImportError:
             pass
 
+    # Display names for telemetry
+    display_seller_model = str(seller_spec)
+    display_buyer_model = str(buyer_spec)
+
     def run_episode_with_tracing(episode_span):
         """Run episode loop, logging to the provided span."""
         nonlocal obs_dict
@@ -373,7 +391,11 @@ def run_episode_command(args: argparse.Namespace) -> int:
                                 "hour": obs.current_hour,
                             })
 
-                        action = seller_agent.act(obs, tool_schemas)
+                        action = seller_agent.act(
+                            obs,
+                            tool_schemas,
+                            episode_context=orchestrator.episode_context,
+                        )
 
                         if llm_span and action:
                             llm_span.set_attribute("llm.has_message", bool(action.message))
@@ -520,6 +542,71 @@ def run_episode_command(args: argparse.Namespace) -> int:
     print(f"  Calls ended by buyer: {final.metrics['calls_ended_by_buyer']}")
     print(f"  DNC violations: {final.metrics['dnc_violations']}")
 
+    # Print token usage
+    print("\nToken Usage:")
+    seller_in, seller_out = seller_agent.get_token_usage()
+    buyer_in, buyer_out = 0, 0
+    print(f"  Seller: {seller_in:,} input, {seller_out:,} output")
+    if hasattr(buyer_simulator, "get_token_usage"):
+        buyer_in, buyer_out = buyer_simulator.get_token_usage()
+        print(f"  Buyer:  {buyer_in:,} input, {buyer_out:,} output")
+    print(f"  Total:  {seller_in + buyer_in:,} input, {seller_out + buyer_out:,} output")
+
+    # Save results to timestamped directory
+    from salesbench.runner.results import EpisodeResult, TokenUsage
+    from salesbench.storage.json_writer import JSONResultsWriter
+
+    # Build episode result
+    token_usage = TokenUsage()
+    token_usage.add_seller_usage(seller_in, seller_out)
+    token_usage.add_buyer_usage(buyer_in, buyer_out)
+
+    episode_result = {
+        "mode": "single_episode",
+        "config": {
+            "seed": args.seed,
+            "num_leads": args.leads,
+            "max_turns": args.max_turns,
+            "seller_model": str(seller_spec),
+            "buyer_model": str(buyer_spec),
+        },
+        "episode_results": [
+            {
+                "episode_id": f"ep_{args.seed}",
+                "episode_index": 0,
+                "seed": args.seed,
+                "status": "completed",
+                "final_score": final.final_score,
+                "total_turns": final.total_turns,
+                "total_accepts": final.metrics.get("accepted_offers", 0),
+                "total_rejects": final.metrics.get("rejected_offers", 0),
+                "total_calls": final.metrics.get("total_calls", 0),
+                "dnc_violations": final.metrics.get("dnc_violations", 0),
+                "metrics": final.metrics,
+                "trajectory": final.history if args.verbose else [],
+                "token_usage": token_usage.to_dict(),
+            }
+        ],
+        "aggregate_metrics": {
+            "total_token_usage": token_usage.to_dict(),
+        },
+    }
+
+    # Extract model name for directory
+    model_name = seller_spec.model
+
+    writer = JSONResultsWriter("results")
+    results_dir = writer.write_benchmark(
+        benchmark_id=f"episode_{args.seed}",
+        result=episode_result,
+        include_traces=args.verbose,
+        custom_name=f"episode_{model_name}",
+    )
+    print(f"\nResults saved to: {results_dir}/")
+    print("  - summary.json")
+    if args.verbose:
+        print("  - traces.json")
+
     # Shutdown telemetry (flushes traces)
     if telemetry_manager:
         print("\nFlushing telemetry traces...")
@@ -538,32 +625,176 @@ def run_benchmark_command(args: argparse.Namespace) -> int:
     Returns:
         Exit code.
     """
+    from salesbench.models import (
+        DEFAULT_BUYER_MODEL,
+        get_default_benchmark_models,
+        parse_model_list,
+        parse_model_spec,
+    )
     from salesbench.runner import BenchmarkConfig, BenchmarkRunner
 
-    # Build config from CLI args
-    config = BenchmarkConfig.from_cli_args(
-        mode=args.mode,
-        episodes=args.episodes,
-        seed=args.seed,
-        leads=args.leads,
-        max_turns=args.max_turns,
-        parallelism=args.parallelism,
-        seller_model=args.seller_model,
-        buyer_model=args.buyer_model,
-        no_supabase=args.no_supabase,
-        no_telemetry=args.no_telemetry,
-        output=args.output,
-        verbose=args.verbose,
-        name=args.name or "",
+    # Determine which models to benchmark
+    if args.models:
+        models = parse_model_list(args.models)
+    else:
+        # No models specified - use default benchmark set
+        models = get_default_benchmark_models()
+        print("No --models specified. Using default set:")
+        for m in models:
+            print(f"  - {m}")
+
+    # Parse buyer model
+    buyer_model = (
+        args.buyer_model or os.environ.get("SALESBENCH_BUYER_MODEL") or DEFAULT_BUYER_MODEL
     )
+    buyer_spec = parse_model_spec(buyer_model)
 
-    # Run benchmark
-    runner = BenchmarkRunner(config)
-    result = runner.run()
+    # Run benchmarks for all models
+    print(f"\nRunning benchmark for {len(models)} model(s)")
+    print(f"Buyer model: {buyer_spec}")
+    print("=" * 60)
 
-    # Return non-zero if any episodes failed
-    if result.failed_episodes > 0:
+    all_passed = True
+    for i, model_spec in enumerate(models, 1):
+        print(f"\n[{i}/{len(models)}] Benchmarking: {model_spec}")
+        print("-" * 40)
+
+        config = BenchmarkConfig.from_cli_args(
+            mode=args.mode,
+            episodes=args.episodes,
+            seed=args.seed,
+            leads=args.leads,
+            max_turns=args.max_turns,
+            parallelism=args.parallelism,
+            seller_model=str(model_spec),
+            buyer_model=str(buyer_spec),
+            no_supabase=args.no_supabase,
+            enable_telemetry=args.telemetry,
+            output=args.output,
+            verbose=args.verbose,
+            name=args.name or "",
+            domain=args.domain,
+        )
+
+        runner = BenchmarkRunner(config)
+        result = runner.run()
+
+        if result.failed_episodes > 0:
+            all_passed = False
+
+    print("\n" + "=" * 60)
+    print(f"Completed benchmarks for {len(models)} model(s)")
+
+    return 0 if all_passed else 1
+
+
+def list_models_command(args: argparse.Namespace) -> int:
+    """List known models and providers.
+
+    Args:
+        args: Command line arguments.
+
+    Returns:
+        Exit code.
+    """
+    from salesbench.models import DEFAULT_BENCHMARK_MODELS, list_known_models
+
+    models_by_provider = list_known_models()
+
+    if args.format == "json":
+        output = {
+            "models_by_provider": models_by_provider,
+            "default_benchmark_set": DEFAULT_BENCHMARK_MODELS,
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        print("Known Models by Provider")
+        print("=" * 60)
+        for provider, models in sorted(models_by_provider.items()):
+            print(f"\n{provider.upper()}")
+            print("-" * 40)
+            for model in models:
+                marker = " *" if model in DEFAULT_BENCHMARK_MODELS else ""
+                print(f"  {model}{marker}")
+
+        print("\n" + "=" * 60)
+        print("Default benchmark set (* above):")
+        for model in DEFAULT_BENCHMARK_MODELS:
+            print(f"  - {model}")
+
+        print("\nUsage:")
+        print("  salesbench run-benchmark                           # Runs default set")
+        print("  salesbench run-benchmark --models openai/gpt-4o    # Single model")
+        print(
+            "  salesbench run-benchmark --models openai/gpt-4o,anthropic/claude-sonnet-4-20250514"
+        )
+
+    return 0
+
+
+def list_domains_command(args: argparse.Namespace) -> int:
+    """List available sales domains.
+
+    Args:
+        args: Command line arguments.
+
+    Returns:
+        Exit code.
+    """
+    # Import domains package to trigger registration
+    import salesbench.domains.insurance  # noqa: F401
+    from salesbench.domains import get_domain, list_domains
+
+    domains = list_domains()
+
+    if args.format == "json":
+        output = []
+        for name in domains:
+            domain = get_domain(name)
+            output.append(
+                {
+                    "name": domain.config.name,
+                    "display_name": domain.config.display_name,
+                    "description": domain.config.description,
+                    "product_types": domain.config.product_types,
+                    "tools": domain.config.tools,
+                }
+            )
+        print(json.dumps(output, indent=2))
+    else:
+        print("Available Sales Domains")
+        print("=" * 60)
+        for name in domains:
+            domain = get_domain(name)
+            print(f"\n{domain.config.display_name} [{name}]")
+            print(f"  {domain.config.description}")
+            print(f"  Products: {', '.join(domain.config.product_types)}")
+            print(f"  Tools: {len(domain.config.tools)} available")
+
+    return 0
+
+
+def leaderboard_command(args: argparse.Namespace) -> int:
+    """Launch the leaderboard UI.
+
+    Args:
+        args: Command line arguments.
+
+    Returns:
+        Exit code.
+    """
+    try:
+        from salesbench.ui.app import create_leaderboard
+    except ImportError:
+        print("ERROR: Gradio is required for the leaderboard UI.")
+        print("Install with: pip install 'salesbench[ui]'")
         return 1
+
+    demo = create_leaderboard(results_dir=args.results_dir)
+    demo.launch(
+        server_port=args.port,
+        share=args.share,
+    )
     return 0
 
 
@@ -705,13 +936,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--seller-model",
         type=str,
         default=None,
-        help="Seller agent model (default: from env or gpt-4o-mini)",
+        help="Seller model. Format: provider/model (e.g., openai/gpt-4o)",
     )
     run_parser.add_argument(
         "--buyer-model",
         type=str,
         default=None,
-        help="Buyer agent model (default: from env or gpt-4o-mini)",
+        help="Buyer model (default: openai/gpt-4o-mini). Format: provider/model",
     )
     run_parser.add_argument(
         "--verbose",
@@ -766,16 +997,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Concurrent episodes (default: based on mode)",
     )
     benchmark_parser.add_argument(
-        "--seller-model",
+        "--models",
         type=str,
         default=None,
-        help="Seller agent model (default: from env)",
+        help="Seller model(s) to benchmark. Format: provider/model. "
+        "Examples: 'openai/gpt-4o' or 'openai/gpt-4o,anthropic/claude-sonnet-4-20250514'. "
+        "If omitted, benchmarks default model set.",
     )
     benchmark_parser.add_argument(
         "--buyer-model",
         type=str,
         default=None,
-        help="Buyer simulator model (default: from env)",
+        help="Buyer simulator model (default: openai/gpt-4o-mini). Format: provider/model.",
     )
     benchmark_parser.add_argument(
         "--mode",
@@ -790,22 +1023,78 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Disable Supabase storage",
     )
     benchmark_parser.add_argument(
-        "--no-telemetry",
+        "--telemetry",
         action="store_true",
-        help="Disable OpenTelemetry/Grafana",
+        help="Enable OpenTelemetry (requires OTEL collector at localhost:4317)",
     )
     benchmark_parser.add_argument(
         "--output",
         "-o",
         type=str,
         default=None,
-        help="JSON output file path",
+        help="Custom name for results directory (default: model name)",
     )
     benchmark_parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
-        help="Verbose output",
+        help="Verbose output + save conversation traces to traces.json",
+    )
+    benchmark_parser.add_argument(
+        "--domain",
+        "-d",
+        type=str,
+        default="insurance",
+        help="Sales domain to benchmark (default: insurance)",
+    )
+
+    # list-models command
+    models_parser = subparsers.add_parser(
+        "list-models",
+        help="List known models and providers",
+    )
+    models_parser.add_argument(
+        "--format",
+        "-f",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    # list-domains command
+    domains_parser = subparsers.add_parser(
+        "list-domains",
+        help="List available sales domains",
+    )
+    domains_parser.add_argument(
+        "--format",
+        "-f",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    # leaderboard command
+    leaderboard_parser = subparsers.add_parser(
+        "leaderboard",
+        help="Launch the leaderboard UI (requires gradio)",
+    )
+    leaderboard_parser.add_argument(
+        "--results-dir",
+        type=str,
+        default=None,
+        help="Directory containing result files (default: results/)",
+    )
+    leaderboard_parser.add_argument(
+        "--port",
+        type=int,
+        default=7860,
+        help="Port to run the server on (default: 7860)",
+    )
+    leaderboard_parser.add_argument(
+        "--share",
+        action="store_true",
+        help="Create a public share link",
     )
 
     args = parser.parse_args(argv)
@@ -824,6 +1113,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         return run_episode_command(args)
     elif args.command == "run-benchmark":
         return run_benchmark_command(args)
+    elif args.command == "list-models":
+        return list_models_command(args)
+    elif args.command == "list-domains":
+        return list_domains_command(args)
+    elif args.command == "leaderboard":
+        return leaderboard_command(args)
     else:
         parser.print_help()
         return 1

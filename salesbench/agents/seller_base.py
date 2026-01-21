@@ -118,6 +118,8 @@ class SellerAgent(ABC):
         self.config = config or SellerConfig()
         self._total_api_cost = 0.0
         self._turn_count = 0
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
 
     @abstractmethod
     def act(self, observation: SellerObservation) -> SellerAction:
@@ -166,7 +168,7 @@ class SellerAgent(ABC):
         return validate_seller_action(action)
 
     def _track_cost(self, input_tokens: int, output_tokens: int, model: str) -> float:
-        """Track API cost for a call.
+        """Track API cost and token usage for a call.
 
         Args:
             input_tokens: Number of input tokens.
@@ -176,6 +178,10 @@ class SellerAgent(ABC):
         Returns:
             Cost for this call.
         """
+        # Track tokens
+        self._total_input_tokens += input_tokens
+        self._total_output_tokens += output_tokens
+
         # Approximate pricing per 1K tokens
         pricing = {
             "gpt-4o": {"input": 0.005, "output": 0.015},
@@ -192,6 +198,14 @@ class SellerAgent(ABC):
 
         self._total_api_cost += cost
         return cost
+
+    def get_token_usage(self) -> tuple[int, int]:
+        """Get total token usage for this episode.
+
+        Returns:
+            Tuple of (input_tokens, output_tokens).
+        """
+        return self._total_input_tokens, self._total_output_tokens
 
 
 class MultiAgentSeller(SellerAgent):
