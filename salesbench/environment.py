@@ -22,10 +22,10 @@ from typing import Optional
 from datasets import Dataset
 
 import verifiers as vf
-from salesbench.core.config import BudgetConfig, SalesBenchConfig, ScoringConfig
+from salesbench.core.config import BudgetConfig, SalesBenchConfig
 from salesbench.envs.sales_mvp.env import SalesEnv
 from salesbench.envs.sales_mvp.verifiers.scoring import (
-    calculate_episode_score,
+    calculate_episode_revenue,
 )
 
 logger = logging.getLogger(__name__)
@@ -288,33 +288,25 @@ TOOL_FUNCTIONS = {
 async def episode_score(state: vf.State) -> float:
     """Calculate the final episode score.
 
-    This reward function evaluates the agent's performance based on:
-    - Accepted offers (primary reward)
-    - Premium amounts (profit proxy)
-    - Close vs followup bonuses
-    - Efficiency (time and tool usage)
-    - Penalties for rejections and DNC violations
+    Score = Total Revenue (sum of monthly premiums from accepted plans).
+
+    This is:
+    - Interpretable ("agent earned $2,400 in monthly premiums")
+    - Aligned with business goal (maximize revenue)
+    - No config needed - revenue is revenue
 
     Args:
         state: The verifiers state containing the SalesEnv.
 
     Returns:
-        Total episode score as a float.
+        Total revenue earned as a float.
     """
     sales_env: Optional[SalesEnv] = state.get("sales_env")
     if sales_env is None:
         return 0.0
 
-    scoring_config = state.get("scoring_config", ScoringConfig())
-    total_days = state.get("total_days", 10)
-
-    components = calculate_episode_score(
-        state=sales_env.state,
-        config=scoring_config,
-        total_days=total_days,
-    )
-
-    return components.total_score
+    metrics = calculate_episode_revenue(sales_env.state)
+    return metrics.total_revenue
 
 
 async def acceptance_rate(state: vf.State) -> float:
@@ -376,11 +368,10 @@ class SalesBenchToolEnv(vf.StatefulToolEnv):
         dataset: Dataset,
         seed: int = 42,
         num_leads: int = 100,
-        total_days: int = 10,
-        max_calls_per_day: int = 50,
+        total_hours: int = 80,
         buyer_model: str = "gpt-4o-mini",
         buyer_temperature: float = 0.3,
-        max_turns: int = 100,
+        safety_max_turns: Optional[int] = None,
         **kwargs,
     ):
         """Initialize the SalesBench environment.
@@ -389,18 +380,16 @@ class SalesBenchToolEnv(vf.StatefulToolEnv):
             dataset: HuggingFace dataset with task configurations.
             seed: Base random seed for reproducibility.
             num_leads: Number of leads to generate per episode.
-            total_days: Total simulated business days.
-            max_calls_per_day: Maximum calls allowed per day.
+            total_hours: Total simulated hours.
             buyer_model: LLM model for buyer simulator.
             buyer_temperature: Temperature for buyer LLM.
-            max_turns: Maximum turns per episode.
+            safety_max_turns: Optional safety ceiling for turns (None = natural termination).
             **kwargs: Additional arguments passed to parent.
         """
         # Store configuration
         self.base_seed = seed
         self.num_leads = num_leads
-        self.total_days = total_days
-        self.max_calls_per_day = max_calls_per_day
+        self.total_hours = total_hours
         self.buyer_model = buyer_model
         self.buyer_temperature = buyer_temperature
 
@@ -414,10 +403,12 @@ class SalesBenchToolEnv(vf.StatefulToolEnv):
         system_prompt = self._build_system_prompt()
 
         # Initialize without tools - we'll add them manually with skipped args
+        # Use a high default if no safety limit is set (verifiers base class requires max_turns)
+        effective_max_turns = safety_max_turns if safety_max_turns else 10000
         super().__init__(
             dataset=dataset,
             tools=[],  # Empty - will add with args_to_skip
-            max_turns=max_turns,
+            max_turns=effective_max_turns,
             rubric=rubric,
             system_prompt=system_prompt,
             **kwargs,
@@ -458,12 +449,8 @@ You have access to the following tools:
 
 ## Scoring
 
-Your performance is measured by:
-- Accepted offers (+100 points each)
-- Premium amounts (bonus based on policy value)
-- Close now vs followup bonuses
-- Efficiency (fewer tool calls, faster completion)
-- Penalties for rejections and DNC violations"""
+Your performance is measured by total revenue earned (sum of monthly premiums from accepted plans).
+The more policies you sell and the higher the premiums, the better your score."""
 
     async def setup_state(self, state: vf.State) -> vf.State:
         """Initialize SalesBench state for each rollout.
@@ -481,18 +468,14 @@ Your performance is measured by:
         input_data = state.get("input", {})
         episode_seed = input_data.get("seed", self.base_seed)
 
-        # Create budget config
-        budget = BudgetConfig(
-            total_days=self.total_days,
-            max_calls_per_day=self.max_calls_per_day,
-        )
+        # Create budget config (time is the only constraint)
+        budget = BudgetConfig(total_hours=self.total_hours)
 
         # Create SalesBench config
         config = SalesBenchConfig(
             seed=episode_seed,
             num_leads=self.num_leads,
             budget=budget,
-            buyer_model=self.buyer_model,
         )
 
         # Create and initialize SalesEnv
@@ -515,16 +498,15 @@ Your performance is measured by:
 
         # Store in state
         state["sales_env"] = sales_env
-        state["scoring_config"] = config.scoring
-        state["total_days"] = self.total_days
+        state["total_hours"] = self.total_hours
 
         # Add initial context to prompt
         obs = sales_env._get_observation()
         context = f"""
 ## Current State
-- Day: {obs['time']['current_day']}, Hour: {obs['time']['current_hour']}:00
+- Time elapsed: {obs['time']['elapsed_hours']}h {obs['time']['elapsed_minutes']}m
 - Available leads: {obs['leads_count']}
-- Total days: {self.total_days}
+- Total hours: {self.total_hours}
 
 Start by searching for leads and making calls."""
 
@@ -638,12 +620,11 @@ def create_salesbench_dataset(
 def load_environment(
     seed: int = 42,
     num_leads: int = 100,
-    total_days: int = 10,
-    max_calls_per_day: int = 50,
+    total_hours: int = 80,
     buyer_model: str = "gpt-4o-mini",
     buyer_temperature: float = 0.3,
     num_episodes: int = 100,
-    max_turns: int = 100,
+    safety_max_turns: Optional[int] = None,
 ) -> SalesBenchToolEnv:
     """Load the SalesBench environment.
 
@@ -653,12 +634,11 @@ def load_environment(
     Args:
         seed: Base random seed for reproducibility.
         num_leads: Number of leads to generate per episode.
-        total_days: Total simulated business days.
-        max_calls_per_day: Maximum calls allowed per day.
+        total_hours: Total simulated hours.
         buyer_model: LLM model for buyer simulator.
         buyer_temperature: Temperature for buyer LLM.
         num_episodes: Number of episodes in the dataset.
-        max_turns: Maximum turns per episode.
+        safety_max_turns: Optional safety turn limit (None = natural termination only).
 
     Returns:
         Configured SalesBenchToolEnv instance.
@@ -684,11 +664,10 @@ def load_environment(
         dataset=dataset,
         seed=seed,
         num_leads=num_leads,
-        total_days=total_days,
-        max_calls_per_day=max_calls_per_day,
+        total_hours=total_hours,
         buyer_model=buyer_model,
         buyer_temperature=buyer_temperature,
-        max_turns=max_turns,
+        safety_max_turns=safety_max_turns,
     )
 
     return env

@@ -2,7 +2,7 @@
 
 import pytest
 
-from salesbench.core.config import BudgetConfig, SalesBenchConfig, ScoringConfig
+from salesbench.core.config import BudgetConfig, SalesBenchConfig
 from salesbench.core.types import (
     BuyerDecision,
     ToolCall,
@@ -26,12 +26,8 @@ def default_config(default_seed: int) -> SalesBenchConfig:
         seed=default_seed,
         num_leads=10,  # Smaller for faster tests
         budget=BudgetConfig(
-            total_days=10,
-            max_calls_per_day=50,
-            max_tool_calls_per_turn=10,
-            max_offers_per_call=3,
+            total_hours=80,  # 10 days × 8 hours
         ),
-        scoring=ScoringConfig(),
     )
 
 

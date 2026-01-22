@@ -53,15 +53,21 @@ def create_leaderboard(
         # Format for display
         rows = []
         for i, r in enumerate(data, 1):
+            # Get token usage
+            total_tokens = r.get("total_tokens", 0)
+            total_cost = r.get("total_cost", 0)
+
             rows.append(
                 [
                     i,  # Rank
                     r.get("model", "unknown"),
-                    r.get("domain", "insurance"),
                     f"{r.get('mean_score', 0):.1f}",
-                    f"{r.get('std_score', 0):.1f}",
                     f"{r.get('acceptance_rate', 0):.1%}",
+                    r.get("total_dnc_violations", 0),
                     r.get("episodes", 0),
+                    f"{total_tokens:,}" if total_tokens else "N/A",
+                    f"${total_cost:.2f}" if total_cost else "N/A",
+                    f"{r.get('duration_seconds', 0):.0f}s",
                     r.get("timestamp", "")[:10] if r.get("timestamp") else "",
                 ]
             )
@@ -88,26 +94,74 @@ def create_leaderboard(
 
         config = result.get("config", {})
         aggregate = result.get("aggregate_metrics", {})
+        token_usage = aggregate.get("total_token_usage", {})
+        cost_breakdown = aggregate.get("total_cost_breakdown", {})
+
+        # Token counts
+        seller_input = token_usage.get("seller_input_tokens", 0)
+        seller_output = token_usage.get("seller_output_tokens", 0)
+        buyer_input = token_usage.get("buyer_input_tokens", 0)
+        buyer_output = token_usage.get("buyer_output_tokens", 0)
+        total_tokens = seller_input + seller_output + buyer_input + buyer_output
+
+        # Costs
+        total_cost = cost_breakdown.get("total_cost", 0)
+        seller_cost = cost_breakdown.get("seller_input_cost", 0) + cost_breakdown.get("seller_output_cost", 0)
+        buyer_cost = cost_breakdown.get("buyer_input_cost", 0) + cost_breakdown.get("buyer_output_cost", 0)
+
+        # Time metrics
+        action_minutes = aggregate.get("mean_action_based_minutes", 0)
+        token_minutes = aggregate.get("mean_token_based_minutes", 0)
+        conversation_turns = aggregate.get("mean_conversation_turns", 0)
 
         details = f"""## Benchmark: {result.get('benchmark_id', 'unknown')}
 
 ### Configuration
-- **Seller Model**: {config.get('seller_model', 'unknown')}
-- **Buyer Model**: {config.get('buyer_model', 'unknown')}
-- **Domain**: {config.get('domain', 'insurance')}
-- **Episodes**: {result.get('completed_episodes', 0)}
-- **Mode**: {config.get('mode', 'unknown')}
+| Setting | Value |
+|---------|-------|
+| Seller Model | {config.get('seller_model', 'unknown')} |
+| Buyer Model | {config.get('buyer_model', 'unknown')} |
+| Domain | {config.get('domain', 'insurance')} |
+| Episodes | {result.get('completed_episodes', 0)} |
+| Mode | {config.get('mode', 'unknown')} |
+| Parallelism | {config.get('parallelism', 1)} |
 
-### Aggregate Results
-- **Mean Score**: {aggregate.get('mean_score', 0):.2f} (std: {aggregate.get('std_score', 0):.2f})
-- **Acceptance Rate**: {aggregate.get('mean_acceptance_rate', 0):.1%}
-- **Mean Calls**: {aggregate.get('mean_calls', 0):.1f}
-- **Mean Offers**: {aggregate.get('mean_offers', 0):.1f}
-- **Total Duration**: {result.get('duration_seconds', 0):.1f}s
+### Performance Results
+| Metric | Value |
+|--------|-------|
+| Mean Score | {aggregate.get('mean_score', 0):.2f} (±{aggregate.get('std_score', 0):.2f}) |
+| Acceptance Rate | {aggregate.get('mean_acceptance_rate', 0):.1%} |
+| Conversion Rate | {aggregate.get('conversion_rate', 0):.1%} |
+| Mean Calls | {aggregate.get('mean_calls', 0):.1f} |
+| Mean Offers | {aggregate.get('mean_offers', 0):.1f} |
+| Episode Success Rate | {aggregate.get('episode_success_rate', 0):.1%} |
+| DNC Violations | {aggregate.get('total_dnc_violations', 0)} |
+
+### Time Metrics
+| Metric | Value |
+|--------|-------|
+| Action-Based Minutes | {action_minutes:.1f} |
+| Token-Based Minutes | {token_minutes:.1f} |
+| Conversation Turns | {conversation_turns:.1f} |
+| Wall-Clock Duration | {result.get('duration_seconds', 0):.1f}s |
+
+### Token Usage (All Episodes)
+| Component | Input | Output | Total |
+|-----------|-------|--------|-------|
+| Seller | {seller_input:,} | {seller_output:,} | {seller_input + seller_output:,} |
+| Buyer | {buyer_input:,} | {buyer_output:,} | {buyer_input + buyer_output:,} |
+| **Total** | **{seller_input + buyer_input:,}** | **{seller_output + buyer_output:,}** | **{total_tokens:,}** |
+
+### Cost Breakdown
+| Component | Cost |
+|-----------|------|
+| Seller | ${seller_cost:.4f} |
+| Buyer | ${buyer_cost:.4f} |
+| **Total** | **${total_cost:.4f}** |
 
 ### Timing
 - **Started**: {result.get('started_at', 'unknown')}
-- **Completed**: {result.get('completed_at', 'unknown')}
+- **Completed**: {result.get('ended_at', 'unknown')}
 """
         return details
 
@@ -124,16 +178,32 @@ def create_leaderboard(
         rows = []
         for ep in episodes:
             metrics = ep.get("metrics", {})
+            token_usage = ep.get("token_usage", {})
+            cost_breakdown = ep.get("cost_breakdown", {})
+
+            # Calculate totals
+            total_tokens = (
+                token_usage.get("seller_input_tokens", 0) +
+                token_usage.get("seller_output_tokens", 0) +
+                token_usage.get("buyer_input_tokens", 0) +
+                token_usage.get("buyer_output_tokens", 0)
+            )
+            total_cost = cost_breakdown.get("total_cost", 0)
+
             rows.append(
                 [
                     ep.get("episode_index", 0) + 1,
                     ep.get("seed", ""),
-                    f"{ep.get('score', 0):.1f}",
+                    f"{ep.get('final_score', ep.get('score', 0)):.1f}",
                     metrics.get("accepted_offers", 0),
                     metrics.get("rejected_offers", 0),
+                    ep.get("dnc_violations", 0),
                     metrics.get("total_calls", 0),
                     ep.get("total_turns", 0),
-                    ep.get("termination_reason", "")[:50],
+                    f"{metrics.get('action_based_minutes', 0):.0f}",
+                    f"{total_tokens:,}" if total_tokens else "0",
+                    f"${total_cost:.3f}" if total_cost else "$0",
+                    ep.get("termination_reason", "")[:30],
                 ]
             )
         return rows
@@ -163,14 +233,16 @@ Benchmarking AI agents on sales conversations.
                     headers=[
                         "Rank",
                         "Model",
-                        "Domain",
                         "Score",
-                        "Std",
-                        "Accept Rate",
+                        "Accept%",
+                        "DNC",
                         "Episodes",
+                        "Tokens",
+                        "Cost",
+                        "Duration",
                         "Date",
                     ],
-                    datatype=["number", "str", "str", "str", "str", "str", "number", "str"],
+                    datatype=["number", "str", "str", "str", "number", "number", "str", "str", "str", "str"],
                     every=refresh_interval,
                     interactive=False,
                     elem_classes=["leaderboard-table"],
@@ -179,8 +251,10 @@ Benchmarking AI agents on sales conversations.
                 gr.Markdown("""
 ### Metrics Explained
 - **Score**: Composite score based on sales outcomes (higher is better)
-- **Accept Rate**: Percentage of offers accepted by buyers
-- **Episodes**: Number of independent sales sessions evaluated
+- **Accept%**: Percentage of offers accepted by buyers
+- **Tokens**: Total tokens used (seller + buyer)
+- **Cost**: Estimated API cost based on token usage
+- **Duration**: Total wall-clock time for benchmark run
                 """)
 
             with gr.Tab("Run Details"):
@@ -203,13 +277,17 @@ Benchmarking AI agents on sales conversations.
                 episode_table = gr.Dataframe(
                     value=[],
                     headers=[
-                        "Episode",
+                        "Ep",
                         "Seed",
                         "Score",
                         "Accepts",
                         "Rejects",
+                        "DNC",
                         "Calls",
                         "Turns",
+                        "Minutes",
+                        "Tokens",
+                        "Cost",
                         "Termination",
                     ],
                     datatype=[
@@ -220,6 +298,10 @@ Benchmarking AI agents on sales conversations.
                         "number",
                         "number",
                         "number",
+                        "number",
+                        "str",
+                        "str",
+                        "str",
                         "str",
                     ],
                     interactive=False,

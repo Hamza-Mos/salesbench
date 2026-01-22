@@ -3,7 +3,6 @@
 from salesbench.core.config import (
     BudgetConfig,
     SalesBenchConfig,
-    ScoringConfig,
 )
 from salesbench.core.errors import (
     BudgetExceeded,
@@ -55,7 +54,6 @@ __all__ = [
     # Config
     "SalesBenchConfig",
     "BudgetConfig",
-    "ScoringConfig",
     # Errors
     "SalesBenchError",
     "ProtocolViolation",

@@ -3,10 +3,12 @@
 Provides different buffering strategies for managing conversation history.
 """
 
+import logging
 from abc import ABC, abstractmethod
-from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Awaitable, Callable, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -18,7 +20,7 @@ class Message:
     name: Optional[str] = None  # Tool name for tool messages
     tool_call_id: Optional[str] = None
     metadata: dict = field(default_factory=dict)
-    priority: int = 0  # Higher = more important
+    priority: int = 0  # Higher = more important (used by LLMCompactBuffer for key events)
     timestamp: int = 0  # Monotonic counter
 
     def to_dict(self) -> dict[str, Any]:
@@ -64,306 +66,132 @@ class MessageBuffer(ABC):
         return [m.to_dict() for m in self.get_messages()]
 
 
-class SlidingWindowBuffer(MessageBuffer):
-    """Fixed-size sliding window buffer.
+class LLMCompactBuffer(MessageBuffer):
+    """Buffer with LLM-based compaction.
 
-    Keeps the N most recent messages.
-    """
-
-    def __init__(self, max_messages: int = 50, max_tokens: Optional[int] = None):
-        self.max_messages = max_messages
-        self.max_tokens = max_tokens
-        self._messages: deque[Message] = deque(maxlen=max_messages)
-        self._counter = 0
-
-    def add(self, message: Message) -> None:
-        message.timestamp = self._counter
-        self._counter += 1
-        self._messages.append(message)
-
-        # Trim by tokens if needed
-        if self.max_tokens:
-            while self.token_count() > self.max_tokens and len(self._messages) > 1:
-                self._messages.popleft()
-
-    def get_messages(self) -> List[Message]:
-        return list(self._messages)
-
-    def clear(self) -> None:
-        self._messages.clear()
-        self._counter = 0
-
-    def token_count(self) -> int:
-        return sum(m.token_estimate() for m in self._messages)
-
-
-class PriorityBuffer(MessageBuffer):
-    """Priority-based buffer that keeps high-priority messages.
-
-    When the buffer is full, removes lowest-priority messages first.
-    """
-
-    def __init__(
-        self,
-        max_messages: int = 50,
-        max_tokens: Optional[int] = None,
-        min_priority_to_keep: int = 0,
-    ):
-        self.max_messages = max_messages
-        self.max_tokens = max_tokens
-        self.min_priority_to_keep = min_priority_to_keep
-        self._messages: List[Message] = []
-        self._counter = 0
-
-    def add(self, message: Message) -> None:
-        message.timestamp = self._counter
-        self._counter += 1
-        self._messages.append(message)
-
-        # Trim by count
-        while len(self._messages) > self.max_messages:
-            self._remove_lowest_priority()
-
-        # Trim by tokens
-        if self.max_tokens:
-            while self.token_count() > self.max_tokens and len(self._messages) > 1:
-                self._remove_lowest_priority()
-
-    def _remove_lowest_priority(self) -> None:
-        """Remove the lowest priority, oldest message."""
-        if not self._messages:
-            return
-
-        # Find lowest priority messages
-        min_priority = min(m.priority for m in self._messages)
-
-        # Among those, find the oldest
-        candidates = [m for m in self._messages if m.priority == min_priority]
-        oldest = min(candidates, key=lambda m: m.timestamp)
-
-        self._messages.remove(oldest)
-
-    def get_messages(self) -> List[Message]:
-        # Return in timestamp order
-        return sorted(self._messages, key=lambda m: m.timestamp)
-
-    def clear(self) -> None:
-        self._messages.clear()
-        self._counter = 0
-
-    def token_count(self) -> int:
-        return sum(m.token_estimate() for m in self._messages)
-
-    def set_priority(self, index: int, priority: int) -> None:
-        """Update priority of a message by index."""
-        if 0 <= index < len(self._messages):
-            self._messages[index].priority = priority
-
-
-class KeyEventBuffer(MessageBuffer):
-    """Buffer that preserves key events and summarizes the rest.
-
-    Key events are marked with high priority and always kept.
-    Other messages may be summarized when the buffer is compacted.
-    """
-
-    def __init__(
-        self,
-        max_messages: int = 100,
-        max_tokens: int = 4000,
-        key_event_priority: int = 10,
-    ):
-        self.max_messages = max_messages
-        self.max_tokens = max_tokens
-        self.key_event_priority = key_event_priority
-        self._messages: List[Message] = []
-        self._summaries: List[Message] = []  # Compacted summaries
-        self._counter = 0
-
-    def add(self, message: Message) -> None:
-        message.timestamp = self._counter
-        self._counter += 1
-        self._messages.append(message)
-
-    def add_key_event(self, content: str, role: str = "system") -> None:
-        """Add a key event that should always be preserved."""
-        message = Message(
-            role=role,
-            content=content,
-            priority=self.key_event_priority,
-            timestamp=self._counter,
-        )
-        self._counter += 1
-        self._messages.append(message)
-
-    def add_summary(self, summary: str) -> None:
-        """Add a summary of compacted messages."""
-        self._summaries.append(
-            Message(
-                role="system",
-                content=f"[Summary of previous conversation]: {summary}",
-                priority=self.key_event_priority - 1,
-                timestamp=self._counter,
-            )
-        )
-        self._counter += 1
-
-    def get_messages(self) -> List[Message]:
-        all_messages = self._summaries + self._messages
-        return sorted(all_messages, key=lambda m: m.timestamp)
-
-    def clear(self) -> None:
-        self._messages.clear()
-        self._summaries.clear()
-        self._counter = 0
-
-    def token_count(self) -> int:
-        return sum(m.token_estimate() for m in self.get_messages())
-
-    def compact(self, summarizer=None, force: bool = False) -> None:
-        """Compact old messages into a summary.
-
-        Args:
-            summarizer: Optional callable that takes messages and returns summary.
-            force: If True, compact even if message count is below threshold.
-                   Used when token count exceeds limit.
-        """
-        # Check if compaction is needed
-        # Compact if: forced (token overflow) OR message count exceeds half
-        needs_compact = force or len(self._messages) > self.max_messages // 2
-        if not needs_compact:
-            return
-
-        # Separate key events from regular messages
-        key_events = [m for m in self._messages if m.priority >= self.key_event_priority]
-        regular = [m for m in self._messages if m.priority < self.key_event_priority]
-
-        # If forced (token overflow), be more aggressive - keep fewer messages
-        if force:
-            keep_count = max(10, self.max_messages // 8)  # Keep ~12-25 recent messages
-        else:
-            keep_count = self.max_messages // 4
-
-        to_compact = regular[:-keep_count] if len(regular) > keep_count else []
-        to_keep = regular[-keep_count:] if len(regular) > keep_count else regular
-
-        if to_compact:
-            if summarizer:
-                summary = summarizer(to_compact)
-            else:
-                # Default: just note how many messages were compacted
-                summary = f"[{len(to_compact)} earlier messages about lead interactions]"
-
-            self.add_summary(summary)
-            self._messages = key_events + to_keep
-
-
-class SimpleCompactBuffer(MessageBuffer):
-    """Buffer with observation masking (not summarization).
-
-    Strategy (based on JetBrains observation masking pattern):
-    1. Key events (priority >= 10): NEVER removed
-    2. Recent messages (last N): NEVER removed
-    3. Older tool results: MASKED to preserve key IDs only
+    When context exceeds threshold, older messages are sent to an LLM
+    to produce a structured memory summary. Recent messages are kept verbatim.
     """
 
     def __init__(
         self,
         max_tokens: int = 100_000,
-        keep_recent: int = 15,
-        key_event_priority: int = 10,
+        keep_recent: int = 10,
+        compaction_fn: Optional[Callable[[str], Awaitable[str]]] = None,
     ):
+        """Initialize the buffer.
+
+        Args:
+            max_tokens: Maximum tokens before triggering compaction.
+            keep_recent: Number of recent messages to keep verbatim.
+            compaction_fn: Async function that takes message text and returns summary.
+        """
         self.max_tokens = max_tokens
         self.keep_recent = keep_recent
-        self.key_event_priority = key_event_priority
         self._messages: List[Message] = []
+        self._compacted_memory: Optional[str] = None
+        self._compaction_fn = compaction_fn
         self._counter = 0
 
     def add(self, message: Message) -> None:
+        """Add a message to the buffer."""
         message.timestamp = self._counter
         self._counter += 1
         self._messages.append(message)
 
     def add_key_event(self, content: str, role: str = "system") -> None:
-        """Add a key event that should always be preserved."""
+        """Add a key event message.
+
+        Key events are marked with higher priority for logging/tracking purposes.
+        With LLM compaction, all older messages get summarized together.
+
+        Args:
+            content: The event content.
+            role: Message role (default: system).
+        """
         self._messages.append(
             Message(
                 role=role,
                 content=content,
-                priority=self.key_event_priority,
+                priority=10,  # Mark as key event for reference
                 timestamp=self._counter,
             )
         )
         self._counter += 1
 
-    def compact_if_needed(self, trigger_tokens: int) -> None:
-        """Compact when exceeding trigger_tokens using observation masking."""
-        if self.token_count() <= trigger_tokens:
-            return
+    async def compact_if_needed(self, trigger_tokens: int) -> bool:
+        """Compact using LLM when exceeding trigger.
 
-        print(f"  [Context] Compacting: {self.token_count():,} > {trigger_tokens:,} tokens")
+        Args:
+            trigger_tokens: Token count threshold to trigger compaction.
 
-        # Separate key events from regular messages
-        key_events = [m for m in self._messages if m.priority >= self.key_event_priority]
+        Returns:
+            True if compaction was performed, False otherwise.
+        """
+        current_tokens = self.token_count()
+        if current_tokens <= trigger_tokens:
+            return False
 
-        # Get recent messages (non-key events)
-        recent_idx = max(0, len(self._messages) - self.keep_recent)
-        recent = [m for m in self._messages[recent_idx:] if m.priority < self.key_event_priority]
-        older = [m for m in self._messages[:recent_idx] if m.priority < self.key_event_priority]
+        if len(self._messages) <= self.keep_recent:
+            return False
 
-        # Mask older tool results instead of summarizing
-        masked = []
-        for msg in older:
-            tool_name = msg.metadata.get("tool_name")
-            if tool_name:
-                masked.append(
-                    Message(
-                        role=msg.role,
-                        content=self._mask_tool_result(tool_name, msg.content),
-                        priority=1,
-                        timestamp=msg.timestamp,
-                        metadata={"masked": True, "original_tool": tool_name},
-                    )
-                )
-            # Drop non-tool older messages entirely
+        before_count = len(self._messages)
+        older = self._messages[: -self.keep_recent]
+        recent = self._messages[-self.keep_recent :]
 
-        self._messages = sorted(key_events + masked + recent, key=lambda m: m.timestamp)
-        print(f"  [Context] After: {self.token_count():,} tokens")
+        logger.info(
+            f"[Seller Context] COMPACTING: {current_tokens:,} > {trigger_tokens:,} tokens "
+            f"({before_count} messages)"
+        )
 
-    def _mask_tool_result(self, tool_name: str, content: str) -> str:
-        """Mask tool result - preserve key identifiers only."""
-        if tool_name == "crm.search_leads":
-            try:
-                import json
-                import re
+        if self._compaction_fn:
+            older_text = self._format_messages(older)
+            self._compacted_memory = await self._compaction_fn(older_text)
 
-                match = re.search(r"\{.*\}", content, re.DOTALL)
-                if match:
-                    data = json.loads(match.group())
-                    leads = data.get("leads", [])
-                    ids = [l.get("lead_id", "?") for l in leads[:5]]
-                    more = f"... (+{len(leads)-5})" if len(leads) > 5 else ""
-                    return f"[crm.search_leads -> {len(leads)} leads: {', '.join(ids)}{more}]"
-            except Exception:
-                pass
-            return "[crm.search_leads -> results]"
-        elif tool_name == "crm.get_lead":
-            return "[crm.get_lead -> details retrieved]"
-        elif tool_name == "calling.start_call":
-            return "[calling.start_call -> connected]"
-        elif tool_name == "products.quote_premium":
-            return "[products.quote_premium -> quote generated]"
-        return f"[{tool_name} -> completed]"
+        self._messages = recent
+        after_tokens = self.token_count()
+
+        logger.info(
+            f"[Seller Context] COMPACTED via LLM: {after_tokens:,} tokens "
+            f"({len(recent)} messages kept, {len(older)} messages summarized)"
+        )
+        return True
+
+    def _format_messages(self, messages: List[Message]) -> str:
+        """Format messages for compaction prompt.
+
+        Args:
+            messages: Messages to format.
+
+        Returns:
+            Formatted string for the compaction prompt.
+        """
+        lines = []
+        for msg in messages:
+            lines.append(f"[{msg.role}]: {msg.content}")
+        return "\n".join(lines)
 
     def get_messages(self) -> List[Message]:
+        """Get all messages in order."""
         return list(self._messages)
 
-    def token_count(self) -> int:
-        return sum(m.token_estimate() for m in self._messages)
+    def get_memory_prefix(self) -> Optional[str]:
+        """Get compacted memory to inject before messages.
 
-    def to_api_messages(self) -> List[dict[str, Any]]:
-        return [m.to_dict() for m in self._messages]
+        Returns:
+            The compacted memory summary, or None if no compaction occurred.
+        """
+        return self._compacted_memory
+
+    def token_count(self) -> int:
+        """Estimate total token count."""
+        base = sum(m.token_estimate() for m in self._messages)
+        if self._compacted_memory:
+            base += len(self._compacted_memory) // 4 + 10
+        return base
 
     def clear(self) -> None:
+        """Clear all messages and compacted memory."""
         self._messages.clear()
+        self._compacted_memory = None
         self._counter = 0

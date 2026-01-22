@@ -4,7 +4,7 @@ This domain wraps the existing sales_mvp implementation and provides
 the insurance-specific configuration, products, personas, and prompts.
 """
 
-from typing import Any, Callable
+from typing import Callable
 
 from salesbench.agents.buyer_llm import BUYER_SYSTEM_PROMPT
 from salesbench.agents.seller_llm import SELLER_SYSTEM_PROMPT
@@ -59,16 +59,6 @@ class InsuranceDomain(BaseDomain):
                 "products.get_plan",
                 "products.quote_premium",
             ],
-            scoring_config={
-                "accept_reward": 100,
-                "close_now_bonus": 50,
-                "schedule_followup_bonus": 20,
-                "reject_penalty": -5,
-                "end_call_penalty": -10,
-                "dnc_violation_penalty": -200,
-                "min_score": -1000,
-                "max_score": 10000,
-            },
         )
 
     def get_product_catalog(self) -> ProductCatalog:
@@ -126,10 +116,3 @@ class InsuranceDomain(BaseDomain):
         """
         return BUYER_SYSTEM_PROMPT
 
-    def get_scoring_config(self) -> dict[str, Any]:
-        """Return scoring configuration for insurance sales.
-
-        Returns:
-            Dictionary with reward/penalty values for various outcomes.
-        """
-        return self.config.scoring_config

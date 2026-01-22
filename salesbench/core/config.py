@@ -1,60 +1,42 @@
 """Configuration dataclasses for SalesBench."""
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass
 class BudgetConfig:
-    """Budget limits for the simulation."""
+    """Time system configuration.
 
-    # Time budgets
-    total_days: int = 10  # Total simulated business days
-    hours_per_day: int = 8  # Working hours per day (9 AM - 5 PM)
+    Time is the only natural constraint - agents work until time runs out.
+
+    Time Model Options:
+        - "action": Fixed costs per action (default)
+        - "token": Time based on token consumption
+
+    Both metrics are always tracked regardless of which model is active.
+    """
+
+    total_hours: int = 80  # Total simulated hours (e.g., 80 = 10 days × 8 hrs)
     minutes_per_hour: int = 60  # Minutes per hour
 
-    # Call budgets
-    max_calls_per_day: int = 50  # Max calls seller can make per day
-    max_call_duration_minutes: int = 30  # Max duration per call
-    max_offers_per_call: int = 3  # Max offers per call
+    # Time model configuration
+    time_model: Literal["action", "token"] = "action"
+    conversation_turn_cost: float = 2.0  # Minutes per conversation turn during call
+    tokens_per_minute: float = 150.0  # For token-based time calculation
 
-    # Tool budgets
-    max_tool_calls_per_turn: int = 10  # Max tool calls in one turn
+    # Action time costs (minutes)
+    start_call_cost: float = 1.0  # Time to initiate a call
+    search_cost: float = 1.0  # Time for CRM search
+    propose_plan_cost: float = 4.0  # Time to present offer + get response
+
+    # Stall detection threshold
+    max_turns_without_tool_call: int = 30  # Turns without tool call before warning
 
     @property
     def total_minutes(self) -> int:
         """Total simulated minutes in the episode."""
-        return self.total_days * self.hours_per_day * self.minutes_per_hour
-
-    @property
-    def minutes_per_day(self) -> int:
-        """Working minutes per day."""
-        return self.hours_per_day * self.minutes_per_hour
-
-
-@dataclass
-class ScoringConfig:
-    """Scoring weights and parameters."""
-
-    # Primary rewards
-    accept_reward: float = 100.0  # Base reward for accepted plan
-    close_now_bonus: float = 50.0  # Bonus for immediate close
-    schedule_followup_bonus: float = 20.0  # Bonus for scheduled followup
-
-    # Penalties
-    reject_penalty: float = -5.0  # Penalty for rejected offer
-    end_call_penalty: float = -10.0  # Penalty for buyer ending call
-    dnc_penalty: float = -200.0  # Penalty for Do Not Call violation
-
-    # Efficiency bonuses
-    time_efficiency_weight: float = 0.1  # Reward for completing faster
-    cost_efficiency_weight: float = 0.05  # Reward for fewer LLM calls
-
-    # Premium-based rewards
-    premium_multiplier: float = 0.5  # Multiply monthly premium for reward
-
-    # Bounds
-    min_score: float = -1000.0
-    max_score: float = 10000.0
+        return self.total_hours * self.minutes_per_hour
 
 
 @dataclass
@@ -97,7 +79,11 @@ class PersonaGenerationConfig:
 
 @dataclass
 class SalesBenchConfig:
-    """Main configuration for SalesBench."""
+    """Main configuration for SalesBench episodes.
+
+    This is the episode-level configuration embedded in BenchmarkConfig.
+    Model configuration (seller_model, buyer_model) lives at the BenchmarkConfig level.
+    """
 
     # Random seed for reproducibility
     seed: int = 42
@@ -107,12 +93,7 @@ class SalesBenchConfig:
 
     # Sub-configurations
     budget: BudgetConfig = field(default_factory=BudgetConfig)
-    scoring: ScoringConfig = field(default_factory=ScoringConfig)
     persona_generation: PersonaGenerationConfig = field(default_factory=PersonaGenerationConfig)
-
-    # LLM configuration
-    buyer_model: str = "gpt-4o-mini"  # Model for buyer simulator
-    buyer_temperature: float = 0.3  # Lower temperature for deterministic decisions
 
     # Debug options
     debug: bool = False
@@ -133,18 +114,15 @@ class SalesBenchConfig:
             "seed": self.seed,
             "num_leads": self.num_leads,
             "budget": {
-                "total_days": self.budget.total_days,
-                "hours_per_day": self.budget.hours_per_day,
-                "max_calls_per_day": self.budget.max_calls_per_day,
-                "max_call_duration_minutes": self.budget.max_call_duration_minutes,
+                "total_hours": self.budget.total_hours,
+                "time_model": self.budget.time_model,
+                "conversation_turn_cost": self.budget.conversation_turn_cost,
+                "tokens_per_minute": self.budget.tokens_per_minute,
+                "start_call_cost": self.budget.start_call_cost,
+                "search_cost": self.budget.search_cost,
+                "propose_plan_cost": self.budget.propose_plan_cost,
+                "max_turns_without_tool_call": self.budget.max_turns_without_tool_call,
             },
-            "scoring": {
-                "accept_reward": self.scoring.accept_reward,
-                "close_now_bonus": self.scoring.close_now_bonus,
-                "reject_penalty": self.scoring.reject_penalty,
-                "dnc_penalty": self.scoring.dnc_penalty,
-            },
-            "buyer_model": self.buyer_model,
             "debug": self.debug,
         }
 
@@ -155,25 +133,20 @@ class SalesBenchConfig:
             seed=data.get("seed", 42),
             num_leads=data.get("num_leads", 100),
             debug=data.get("debug", False),
-            buyer_model=data.get("buyer_model", "gpt-4o-mini"),
         )
 
         if "budget" in data:
             budget_data = data["budget"]
+            # Use dataclass defaults by referencing config.budget values
             config.budget = BudgetConfig(
-                total_days=budget_data.get("total_days", 10),
-                hours_per_day=budget_data.get("hours_per_day", 8),
-                max_calls_per_day=budget_data.get("max_calls_per_day", 50),
-                max_call_duration_minutes=budget_data.get("max_call_duration_minutes", 30),
-            )
-
-        if "scoring" in data:
-            scoring_data = data["scoring"]
-            config.scoring = ScoringConfig(
-                accept_reward=scoring_data.get("accept_reward", 100.0),
-                close_now_bonus=scoring_data.get("close_now_bonus", 50.0),
-                reject_penalty=scoring_data.get("reject_penalty", -5.0),
-                dnc_penalty=scoring_data.get("dnc_penalty", -200.0),
+                total_hours=budget_data.get("total_hours", config.budget.total_hours),
+                time_model=budget_data.get("time_model", config.budget.time_model),
+                conversation_turn_cost=budget_data.get("conversation_turn_cost", config.budget.conversation_turn_cost),
+                tokens_per_minute=budget_data.get("tokens_per_minute", config.budget.tokens_per_minute),
+                start_call_cost=budget_data.get("start_call_cost", config.budget.start_call_cost),
+                search_cost=budget_data.get("search_cost", config.budget.search_cost),
+                propose_plan_cost=budget_data.get("propose_plan_cost", config.budget.propose_plan_cost),
+                max_turns_without_tool_call=budget_data.get("max_turns_without_tool_call", config.budget.max_turns_without_tool_call),
             )
 
         return config

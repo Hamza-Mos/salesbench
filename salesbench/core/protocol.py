@@ -205,19 +205,32 @@ def get_tool_schema(tool_name: str) -> dict[str, Any]:
         },
         "calendar.get_availability": {
             "type": "object",
+            "description": "Check available time slots. Hours are relative to episode start (0 = start of episode).",
             "properties": {
-                "day": {"type": "integer", "minimum": 1, "maximum": 10},
+                "from_hour": {
+                    "type": "integer",
+                    "description": "Starting hour to check (0-indexed from episode start). Must be within episode's total_hours budget.",
+                },
+                "num_hours": {
+                    "type": "integer",
+                    "default": 8,
+                    "description": "Number of hours to check from from_hour.",
+                },
             },
             "required": [],
         },
         "calendar.schedule_call": {
             "type": "object",
+            "description": "Schedule a follow-up call with a lead.",
             "properties": {
                 "lead_id": {"type": "string"},
-                "day": {"type": "integer", "minimum": 1, "maximum": 10},
-                "hour": {"type": "integer", "minimum": 9, "maximum": 17},
+                "hour": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Hour to schedule (0-indexed from episode start). Must be in the future and within the episode's total_hours budget. Use calendar.get_availability first to see valid hours.",
+                },
             },
-            "required": ["lead_id", "day", "hour"],
+            "required": ["lead_id", "hour"],
         },
         "calling.start_call": {
             "type": "object",
@@ -262,12 +275,37 @@ def get_tool_schema(tool_name: str) -> dict[str, Any]:
         },
         "products.quote_premium": {
             "type": "object",
+            "description": "Get a premium quote for an insurance plan.",
             "properties": {
-                "plan_id": {"type": "string"},
-                "age": {"type": "integer"},
-                "coverage_amount": {"type": "number"},
-                "risk_class": {"type": "string"},
-                "term_years": {"type": "integer"},
+                "plan_id": {
+                    "type": "string",
+                    "enum": ["TERM", "WHOLE", "UL", "VUL", "LTC", "DI"],
+                    "description": "The insurance plan type.",
+                },
+                "age": {"type": "integer", "description": "Age of the insured."},
+                "coverage_amount": {
+                    "type": "number",
+                    "description": (
+                        "For life insurance (TERM/WHOLE/UL/VUL): the death benefit in dollars (e.g., 500000 for $500k). "
+                        "For DI (disability): the MONTHLY benefit amount (e.g., 5000 for $5k/month). Valid range: 1000-15000. "
+                        "For LTC: the benefit pool amount."
+                    ),
+                },
+                "risk_class": {
+                    "type": "string",
+                    "enum": ["preferred_plus", "preferred", "standard_plus", "standard", "substandard"],
+                    "description": "Risk classification. Default: standard_plus.",
+                },
+                "term_years": {
+                    "type": "integer",
+                    "enum": [10, 15, 20, 30],
+                    "description": "Term length for TERM plans only. Default: 20.",
+                },
+                "waiting_period_days": {
+                    "type": "integer",
+                    "enum": [30, 60, 90, 180],
+                    "description": "Elimination period before benefits begin. Only for DI and LTC. Default: 90.",
+                },
             },
             "required": ["plan_id", "age", "coverage_amount"],
         },

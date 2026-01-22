@@ -23,7 +23,7 @@ class CallMetrics:
     failed_calls: int = 0  # Calls with buyer end
     total_call_minutes: int = 0
     avg_call_duration: float = 0.0
-    calls_per_day: float = 0.0
+    calls_per_hour: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -32,7 +32,7 @@ class CallMetrics:
             "failed_calls": self.failed_calls,
             "total_call_minutes": self.total_call_minutes,
             "avg_call_duration": round(self.avg_call_duration, 2),
-            "calls_per_day": round(self.calls_per_day, 2),
+            "calls_per_hour": round(self.calls_per_hour, 2),
         }
 
 
@@ -91,7 +91,7 @@ class EfficiencyMetrics:
     total_tool_calls: int = 0
     tool_calls_per_accept: float = 0.0
     minutes_per_accept: float = 0.0
-    days_used: int = 0
+    hours_used: int = 0
     time_efficiency: float = 0.0  # 0-1, higher is better
 
     def to_dict(self) -> dict[str, Any]:
@@ -99,7 +99,7 @@ class EfficiencyMetrics:
             "total_tool_calls": self.total_tool_calls,
             "tool_calls_per_accept": round(self.tool_calls_per_accept, 2),
             "minutes_per_accept": round(self.minutes_per_accept, 2),
-            "days_used": self.days_used,
+            "hours_used": self.hours_used,
             "time_efficiency": round(self.time_efficiency, 4),
         }
 
@@ -147,13 +147,13 @@ class EpisodeMetrics:
 class MetricsEngine:
     """Computes comprehensive metrics from environment state."""
 
-    def __init__(self, total_days: int = 10):
+    def __init__(self, total_hours: int = 80):
         """Initialize the metrics engine.
 
         Args:
-            total_days: Total days available in episode.
+            total_hours: Total hours available in episode.
         """
-        self.total_days = total_days
+        self.total_hours = total_hours
 
     def compute(self, state: "EnvironmentState") -> EpisodeMetrics:
         """Compute all metrics from environment state.
@@ -202,8 +202,8 @@ class MetricsEngine:
         if metrics.total_calls > 0:
             metrics.avg_call_duration = metrics.total_call_minutes / metrics.total_calls
 
-        days_used = max(1, state.time.current_day)
-        metrics.calls_per_day = metrics.total_calls / days_used
+        hours_used = max(1, state.time.elapsed_hours)
+        metrics.calls_per_hour = metrics.total_calls / hours_used
 
         return metrics
 
@@ -277,7 +277,7 @@ class MetricsEngine:
         """Compute efficiency-related metrics."""
         metrics = EfficiencyMetrics()
         metrics.total_tool_calls = state.total_tool_calls
-        metrics.days_used = state.time.current_day
+        metrics.hours_used = state.time.elapsed_hours
 
         accepts = other_metrics.offers.accepted_offers
 
@@ -286,12 +286,12 @@ class MetricsEngine:
             metrics.minutes_per_accept = state.stats.total_call_minutes / accepts
 
         # Time efficiency: how much of the time budget was used effectively
-        if self.total_days > 0:
+        if self.total_hours > 0:
             # Higher score for finishing faster with more accepts
-            days_ratio = metrics.days_used / self.total_days
+            hours_ratio = metrics.hours_used / self.total_hours
             if accepts > 0:
-                # Efficiency = accepts / days_ratio (more accepts in less time = better)
-                metrics.time_efficiency = min(1.0, accepts / (days_ratio * 10))
+                # Efficiency = accepts / hours_ratio (more accepts in less time = better)
+                metrics.time_efficiency = min(1.0, accepts / (hours_ratio * 10))
             else:
                 metrics.time_efficiency = 0.0
 
@@ -336,16 +336,16 @@ class MetricsEngine:
 
 def compute_episode_metrics(
     state: "EnvironmentState",
-    total_days: int = 10,
+    total_hours: int = 80,
 ) -> EpisodeMetrics:
     """Compute episode metrics from state.
 
     Args:
         state: Environment state.
-        total_days: Total available days.
+        total_hours: Total available hours.
 
     Returns:
         Complete episode metrics.
     """
-    engine = MetricsEngine(total_days=total_days)
+    engine = MetricsEngine(total_hours=total_hours)
     return engine.compute(state)

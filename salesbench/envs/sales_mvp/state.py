@@ -24,44 +24,37 @@ from salesbench.envs.sales_mvp.personas import Persona
 
 @dataclass
 class TimeState:
-    """Tracks simulated time."""
+    """Tracks simulated time as elapsed hours and minutes."""
 
-    current_day: int = 1  # Days 1-10
-    current_hour: int = 9  # Hours 9-17 (9 AM - 5 PM)
-    current_minute: int = 0  # Minutes 0-59
+    elapsed_hours: int = 0  # Total hours elapsed (starts at 0)
+    elapsed_minutes: int = 0  # Minutes within current hour (0-59)
 
     def total_minutes(self) -> int:
         """Get total elapsed minutes from start."""
-        day_minutes = (self.current_day - 1) * 8 * 60
-        hour_minutes = (self.current_hour - 9) * 60
-        return day_minutes + hour_minutes + self.current_minute
+        return self.elapsed_hours * 60 + self.elapsed_minutes
 
     def advance_minutes(self, minutes: int, budget: BudgetConfig) -> None:
-        """Advance time by given minutes."""
-        self.current_minute += minutes
+        """Advance time by given minutes.
 
-        while self.current_minute >= 60:
-            self.current_minute -= 60
-            self.current_hour += 1
+        Args:
+            minutes: Number of minutes to advance.
+            budget: Budget config (unused, kept for API compatibility).
+        """
+        self.elapsed_minutes += minutes
 
-        while self.current_hour >= 17:  # End of day
-            self.current_hour = 9  # Start of next day
-            self.current_day += 1
-
-    def is_end_of_day(self) -> bool:
-        """Check if it's end of business day."""
-        return self.current_hour >= 17
+        while self.elapsed_minutes >= 60:
+            self.elapsed_minutes -= 60
+            self.elapsed_hours += 1
 
     def is_episode_ended(self, budget: BudgetConfig) -> bool:
         """Check if episode time has ended."""
-        return self.current_day > budget.total_days
+        return self.elapsed_hours >= budget.total_hours
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
-            "current_day": self.current_day,
-            "current_hour": self.current_hour,
-            "current_minute": self.current_minute,
+            "elapsed_hours": self.elapsed_hours,
+            "elapsed_minutes": self.elapsed_minutes,
             "total_minutes": self.total_minutes(),
         }
 
@@ -70,7 +63,6 @@ class TimeState:
 class CallStats:
     """Statistics for calls made."""
 
-    calls_today: int = 0
     total_calls: int = 0
     total_call_minutes: int = 0
     accepted_offers: int = 0
@@ -81,7 +73,6 @@ class CallStats:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
-            "calls_today": self.calls_today,
             "total_calls": self.total_calls,
             "total_call_minutes": self.total_call_minutes,
             "accepted_offers": self.accepted_offers,
@@ -119,10 +110,6 @@ class EnvironmentState:
         """Reset per-turn counters."""
         self.tool_calls_this_turn = 0
 
-    def reset_day(self) -> None:
-        """Reset per-day counters."""
-        self.stats.calls_today = 0
-
     def get_lead(self, lead_id: LeadID) -> Optional[Persona]:
         """Get a lead by ID."""
         return self.leads.get(lead_id)
@@ -155,43 +142,59 @@ class EnvironmentState:
     def schedule_appointment(
         self,
         lead_id: LeadID,
-        day: int,
-        hour: int,
+        scheduled_hour: int,
     ) -> Optional[Appointment]:
-        """Schedule an appointment."""
+        """Schedule an appointment at a future hour.
+
+        Args:
+            lead_id: The lead to schedule.
+            scheduled_hour: The elapsed hour to schedule at (must be >= current elapsed_hours).
+        """
         if lead_id not in self.leads:
             return None
 
         # Check for conflicts
         for appt in self.appointments.values():
-            if appt.scheduled_day == day and appt.scheduled_hour == hour:
+            if appt.scheduled_hour == scheduled_hour:
                 return None
 
         appointment = Appointment(
             appointment_id=generate_appointment_id(),
             lead_id=lead_id,
-            scheduled_day=day,
-            scheduled_hour=hour,
+            scheduled_day=1,  # Kept for compatibility, not used
+            scheduled_hour=scheduled_hour,
             created_at=self.time.total_minutes(),
         )
         self.appointments[appointment.appointment_id] = appointment
         return appointment
 
-    def get_availability(self, day: int) -> list[int]:
-        """Get available hours for a given day."""
+    def get_availability(
+        self, from_hour: int, num_hours: int = 8, max_hour: Optional[int] = None
+    ) -> list[int]:
+        """Get available hours starting from a given hour.
+
+        Args:
+            from_hour: Starting hour to check.
+            num_hours: Number of hours to check (default 8).
+            max_hour: Maximum valid hour (exclusive). If provided, caps the range.
+        """
         booked = set()
         for appt in self.appointments.values():
-            if appt.scheduled_day == day and not appt.completed:
+            if not appt.completed:
                 booked.add(appt.scheduled_hour)
-        return [h for h in range(9, 17) if h not in booked]
+
+        end_hour = from_hour + num_hours
+        if max_hour is not None:
+            end_hour = min(end_hour, max_hour)
+
+        return [h for h in range(from_hour, end_hour) if h not in booked]
 
     def get_scheduled_for_now(self) -> list[Appointment]:
         """Get appointments scheduled for current time."""
         return [
             appt
             for appt in self.appointments.values()
-            if appt.scheduled_day == self.time.current_day
-            and appt.scheduled_hour == self.time.current_hour
+            if appt.scheduled_hour == self.time.elapsed_hours
             and not appt.completed
         ]
 

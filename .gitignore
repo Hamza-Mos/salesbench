@@ -88,3 +88,8 @@ logs/
 # Benchmark outputs
 results/
 outputs/
+
+.claude/
+.cursor/
+
+.ruff_cache/

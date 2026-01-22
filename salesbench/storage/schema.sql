@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS salesbench_episodes (
     started_at TIMESTAMPTZ NOT NULL,
     ended_at TIMESTAMPTZ,
     num_leads INTEGER DEFAULT 100,
-    total_days INTEGER DEFAULT 10,
+    total_hours INTEGER DEFAULT 80,
     final_score DOUBLE PRECISION,
     metrics JSONB,
     config JSONB,

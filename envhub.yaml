@@ -15,11 +15,10 @@ environment:
     seed: 42
     num_leads: 100
     total_days: 10
-    max_calls_per_day: 50
     buyer_model: gpt-4o-mini
     buyer_temperature: 0.3
     num_episodes: 100
-    max_turns: 100
+    safety_max_turns: null  # No artificial limit - natural termination only
 
   # Configuration schema
   config_schema:
@@ -39,10 +38,6 @@ environment:
       default: 10
       min: 1
       max: 30
-    max_calls_per_day:
-      type: integer
-      description: Maximum calls allowed per day
-      default: 50
     buyer_model:
       type: string
       description: LLM model for buyer simulator
@@ -57,10 +52,11 @@ environment:
       type: integer
       description: Number of episodes in dataset
       default: 100
-    max_turns:
+    safety_max_turns:
       type: integer
-      description: Maximum turns per episode
-      default: 100
+      description: Optional safety turn limit (null = natural termination only)
+      default: null
+      nullable: true
 
 # Scoring configuration
 scoring:

@@ -75,10 +75,10 @@ GROUP BY DATE(started_at), model_name
 ORDER BY date DESC, avg_score DESC;
 
 -- -----------------------------------------------------------------------------
--- Pass@k Analysis
+-- Episode Success Rate Analysis
 -- -----------------------------------------------------------------------------
 
--- Calculate pass@k manually for a benchmark
+-- Calculate episode success rate for a benchmark
 WITH episode_success AS (
     SELECT
         episode_id,
@@ -87,9 +87,9 @@ WITH episode_success AS (
     WHERE config->>'benchmark_id' = 'bench_abc12345'
 )
 SELECT
-    COUNT(*) as n,
-    SUM(CASE WHEN has_accepts THEN 1 ELSE 0 END) as c,
-    SUM(CASE WHEN has_accepts THEN 1 ELSE 0 END)::float / COUNT(*) as success_rate
+    COUNT(*) as total_episodes,
+    SUM(CASE WHEN has_accepts THEN 1 ELSE 0 END) as successful_episodes,
+    SUM(CASE WHEN has_accepts THEN 1 ELSE 0 END)::float / COUNT(*) as episode_success_rate
 FROM episode_success;
 
 -- -----------------------------------------------------------------------------

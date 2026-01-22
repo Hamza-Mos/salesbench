@@ -14,16 +14,19 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+from salesbench.context.compaction import (
+    create_buyer_compaction_fn,
+    create_seller_compaction_fn,
+)
 from salesbench.context.episode import EpisodeContext
 from salesbench.core.config import SalesBenchConfig
-from salesbench.core.errors import BudgetExceeded, EpisodeTerminated
+from salesbench.core.errors import EpisodeTerminated
 from salesbench.core.types import ToolCall, ToolResult
 from salesbench.envs.sales_mvp.env import SalesEnv
-from salesbench.models import ModelConfig, ModelSpec
+from salesbench.models import ModelSpec, get_model_config
 from salesbench.orchestrator.budgets import BudgetTracker
 from salesbench.orchestrator.termination import (
     TerminationChecker,
-    TerminationReason,
     TerminationStatus,
 )
 
@@ -97,6 +100,7 @@ class Orchestrator:
         scorer: Optional[Callable[["Orchestrator"], float]] = None,
         seller_model_spec: Optional[ModelSpec] = None,
         buyer_model_spec: Optional[ModelSpec] = None,
+        safety_max_turns: Optional[int] = None,
     ):
         """Initialize the orchestrator.
 
@@ -105,11 +109,13 @@ class Orchestrator:
             scorer: Optional custom scoring function.
             seller_model_spec: Model specification for seller (used for context management).
             buyer_model_spec: Model specification for buyer (used for context management).
+            safety_max_turns: Optional safety ceiling for turns (None = natural termination only).
         """
         self.config = config or SalesBenchConfig()
         self._scorer = scorer
         self._seller_model_spec = seller_model_spec
         self._buyer_model_spec = buyer_model_spec
+        self._safety_max_turns = safety_max_turns
 
         # Create environment
         self._env = SalesEnv(self.config)
@@ -120,7 +126,7 @@ class Orchestrator:
         # Create termination checker
         self._termination_checker = TerminationChecker(
             budget=self.config.budget,
-            max_turns=None,  # No turn limit by default
+            safety_max_turns=safety_max_turns,
         )
 
         # Episode state
@@ -130,21 +136,51 @@ class Orchestrator:
         self._history: list[dict[str, Any]] = []
         self._cumulative_score = 0.0
 
-        # Get model configs for context management
-        seller_cfg = seller_model_spec.config if seller_model_spec else None
-        buyer_cfg = buyer_model_spec.config if buyer_model_spec else None
+        # Get model configs for context management (use defaults if not provided)
+        seller_cfg = (
+            seller_model_spec.config if seller_model_spec else get_model_config("gpt-4o")
+        )
+        buyer_cfg = (
+            buyer_model_spec.config if buyer_model_spec else get_model_config("gpt-4o-mini")
+        )
 
-        # Episode context for conversation management with model-aware compression
+        # Create compaction functions using same models as agents
+        seller_compaction_fn = None
+        buyer_compaction_fn = None
+
+        if seller_model_spec:
+            try:
+                seller_compaction_fn = create_seller_compaction_fn(
+                    seller_model_spec.provider,
+                    seller_model_spec.model,
+                )
+                logger.debug(f"[Orchestrator] Created seller compaction fn: {seller_model_spec}")
+            except Exception as e:
+                logger.warning(f"[Orchestrator] Failed to create seller compaction fn: {e}")
+
+        if buyer_model_spec:
+            try:
+                buyer_compaction_fn = create_buyer_compaction_fn(
+                    buyer_model_spec.provider,
+                    buyer_model_spec.model,
+                )
+                logger.debug(f"[Orchestrator] Created buyer compaction fn: {buyer_model_spec}")
+            except Exception as e:
+                logger.warning(f"[Orchestrator] Failed to create buyer compaction fn: {e}")
+
+        # Episode context for conversation management with LLM-based compaction
         self._episode_context = EpisodeContext(
             seller_model_config=seller_cfg,
             buyer_model_config=buyer_cfg,
+            seller_compaction_fn=seller_compaction_fn,
+            buyer_compaction_fn=buyer_compaction_fn,
         )
 
         # Guardrails for benchmark-clean trajectories
-        self._last_search_signature: Optional[tuple[tuple[str, Any], ...]] = None
-        self._last_search_turn: int = 0
-        self._duplicate_search_count: int = 0
         self._propose_without_message_count: int = 0
+
+        # Stall detection: track turns since last tool call during active calls
+        self._turns_since_tool_call: int = 0
 
     @property
     def is_terminated(self) -> bool:
@@ -186,24 +222,54 @@ class Orchestrator:
         self._history = []
         self._cumulative_score = 0.0
 
-        # Get model configs for context management
-        seller_cfg = self._seller_model_spec.config if self._seller_model_spec else None
-        buyer_cfg = self._buyer_model_spec.config if self._buyer_model_spec else None
+        # Get model configs for context management (use defaults if not provided)
+        seller_cfg = (
+            self._seller_model_spec.config
+            if self._seller_model_spec
+            else get_model_config("gpt-4o")
+        )
+        buyer_cfg = (
+            self._buyer_model_spec.config
+            if self._buyer_model_spec
+            else get_model_config("gpt-4o-mini")
+        )
 
-        # Reset episode context for new episode with model-aware compression
+        # Create compaction functions using same models as agents
+        seller_compaction_fn = None
+        buyer_compaction_fn = None
+
+        if self._seller_model_spec:
+            try:
+                seller_compaction_fn = create_seller_compaction_fn(
+                    self._seller_model_spec.provider,
+                    self._seller_model_spec.model,
+                )
+            except Exception as e:
+                logger.warning(f"[Orchestrator] Failed to create seller compaction fn: {e}")
+
+        if self._buyer_model_spec:
+            try:
+                buyer_compaction_fn = create_buyer_compaction_fn(
+                    self._buyer_model_spec.provider,
+                    self._buyer_model_spec.model,
+                )
+            except Exception as e:
+                logger.warning(f"[Orchestrator] Failed to create buyer compaction fn: {e}")
+
+        # Reset episode context for new episode with LLM-based compaction
         self._episode_context = EpisodeContext(
             seller_model_config=seller_cfg,
             buyer_model_config=buyer_cfg,
+            seller_compaction_fn=seller_compaction_fn,
+            buyer_compaction_fn=buyer_compaction_fn,
         )
 
         # Set episode context on environment for buyer history
         self._env.set_episode_context(self._episode_context)
 
         # Reset guardrails
-        self._last_search_signature = None
-        self._last_search_turn = 0
-        self._duplicate_search_count = 0
         self._propose_without_message_count = 0
+        self._turns_since_tool_call = 0
 
         return observation
 
@@ -234,6 +300,8 @@ class Orchestrator:
         # Execute tool calls
         tool_results = []
         proposal_executed = False
+        successful_tool_calls = 0
+        call_started_this_turn = False
         for tc in tool_calls:
             try:
                 # --- Guardrail: require a spoken seller message when proposing a plan ---
@@ -274,55 +342,44 @@ class Orchestrator:
                     )
                     continue
 
-                # --- Guardrail: block duplicate search_leads on consecutive turns ---
-                if tc.tool_name == "crm.search_leads":
-                    sig = tuple(sorted((tc.arguments or {}).items()))
-                    if (
-                        self._last_search_signature == sig
-                        and self._last_search_turn == self._termination_checker.turn_count - 1
-                    ):
-                        self._duplicate_search_count += 1
-                        count = self._duplicate_search_count
+                # --- Guardrail: graceful skip for call-state precondition failures ---
+                if tc.tool_name == "calling.end_call" and not self._env.is_in_call:
+                    skip_result = ToolResult(
+                        call_id=tc.call_id,
+                        success=True,  # Not a failure, just a no-op
+                        data={"skipped": True, "reason": "no_active_call"},
+                        message="Skipped: No active call to end. Start a call first.",
+                    )
+                    tool_results.append(skip_result)
+                    logger.info(f"[TOOL][SKIP] {tc.tool_name} - no active call")
+                    continue
 
-                        if count == 1:
-                            error_msg = (
-                                "Duplicate crm.search_leads on consecutive turns. "
-                                "Change filters (temperature, min_income, etc.) or take a different action."
-                            )
-                        else:
-                            warning_text = f"Duplicate search {count}x - change filters or take different action"
-                            error_msg = (
-                                f"REPEATED VIOLATION ({count}x): Same search on consecutive turns. "
-                                f"Change filters or take a different action (start a call, check calendar, etc.)."
-                            )
-                            self._episode_context._anchored_state.add_protocol_warning(warning_text)
-                            logger.warning(f"[PROTOCOL] {warning_text}")
-
-                        tool_results.append(
-                            ToolResult(call_id=tc.call_id, success=False, error=error_msg)
-                        )
-                        continue
-
-                # Check budget before execution
-                self._budget_tracker.enforce_tool_call()
+                if tc.tool_name == "calling.propose_plan" and not self._env.is_in_call:
+                    skip_result = ToolResult(
+                        call_id=tc.call_id,
+                        success=True,  # Not a failure, just a no-op
+                        data={"skipped": True, "reason": "no_active_call"},
+                        message="Skipped: Cannot propose plan without active call. Use calling.start_call first.",
+                    )
+                    tool_results.append(skip_result)
+                    logger.info(f"[TOOL][SKIP] {tc.tool_name} - no active call")
+                    continue
 
                 # Execute tool
                 result = self._env.execute_tool(tc)
                 tool_results.append(result)
+
+                # Track successful tool calls for stall detection
+                if result.success:
+                    successful_tool_calls += 1
+                    if tc.tool_name == "calling.start_call":
+                        call_started_this_turn = True
 
                 # Record to episode context
                 self._record_tool_to_context(tc, result)
 
                 # Record usage
                 self._budget_tracker.record_tool_call()
-
-                # Update duplicate-search tracking on successful searches
-                if tc.tool_name == "crm.search_leads" and result.success:
-                    self._last_search_signature = tuple(sorted((tc.arguments or {}).items()))
-                    self._last_search_turn = self._termination_checker.turn_count
-                    if self._duplicate_search_count > 0:
-                        self._duplicate_search_count = 0
-                        self._episode_context._anchored_state.clear_protocol_warnings()
 
                 # Mark that we executed a proposal (even if rejected/accepted)
                 if tc.tool_name == "calling.propose_plan":
@@ -341,15 +398,6 @@ class Orchestrator:
                 if tc.tool_name == "calling.end_call" and result.success:
                     break
 
-            except BudgetExceeded as e:
-                tool_results.append(
-                    ToolResult(
-                        call_id=tc.call_id,
-                        success=False,
-                        error=str(e),
-                    )
-                )
-                break
             except Exception as e:
                 tool_results.append(
                     ToolResult(
@@ -359,19 +407,50 @@ class Orchestrator:
                     )
                 )
 
+        # --- Stall detection: track turns without tool calls during active calls ---
+        if call_started_this_turn:
+            # Reset counter when a new call starts
+            self._turns_since_tool_call = 0
+        elif self._env.is_in_call:
+            # During an active call, track turns without successful tool calls
+            if successful_tool_calls > 0:
+                self._turns_since_tool_call = 0
+            else:
+                self._turns_since_tool_call += 1
+        else:
+            # Not in a call, reset counter
+            self._turns_since_tool_call = 0
+
         # End turn and get observation
         observation = self._env.end_turn()
         self._budget_tracker.reset_turn()
+        logger.debug(f"[TURN:{self._termination_checker.turn_count}] Turn ended - {self._env.state.time.elapsed_hours}h {int(self._env.state.time.elapsed_minutes):02d}m")
+
+        # --- Inject stall warning if threshold exceeded ---
+        max_turns = self.config.budget.max_turns_without_tool_call
+        if self._env.is_in_call and self._turns_since_tool_call >= max_turns:
+            observation["system_warning"] = (
+                f"🚨 STALL DETECTED ({self._turns_since_tool_call} turns without tool calls) - MANDATORY ACTION REQUIRED 🚨\n\n"
+                "This conversation is going in circles. You MUST end this call NOW.\n\n"
+                "REQUIRED ACTION: calling.end_call(reason='lead_not_ready')\n\n"
+                "DO NOT: Ask more questions, explain again, or continue pitching.\n"
+                "The buyer is not ready. Move on to the next lead."
+            )
+            logger.warning(f"[STALL] Turn {self._termination_checker.turn_count}: {self._turns_since_tool_call} turns without tool call")
 
         # Update budget tracker with current time
         self._budget_tracker.record_time(
-            day=self._env.state.time.current_day,
-            hour=self._env.state.time.current_hour,
-            minute=self._env.state.time.current_minute,
+            elapsed_hours=self._env.state.time.elapsed_hours,
+            elapsed_minutes=self._env.state.time.elapsed_minutes,
+        )
+
+        # Sync action_based_minutes with the environment's time system
+        # The time system tracks elapsed minutes based on action costs (start_call, propose_plan, etc.)
+        self._budget_tracker.usage.action_based_minutes = float(
+            self._budget_tracker.usage.total_elapsed_minutes
         )
 
         # Sync call stats
-        self._budget_tracker.usage.calls_today = self._env.state.stats.calls_today
         self._budget_tracker.usage.calls_total = self._env.state.stats.total_calls
         self._budget_tracker.usage.call_minutes_total = self._env.state.stats.total_call_minutes
 
@@ -410,14 +489,16 @@ class Orchestrator:
     def _calculate_turn_score(self, tool_results: list[ToolResult]) -> float:
         """Calculate score for a turn based on tool results.
 
+        Score = Total Revenue (sum of monthly premiums from accepted plans).
+        This is simple, interpretable, and aligned with the business goal.
+
         Args:
             tool_results: Results from tool executions.
 
         Returns:
-            Score for this turn.
+            Revenue earned this turn (monthly premium of accepted plans).
         """
-        score = 0.0
-        scoring = self.config.scoring
+        revenue = 0.0
 
         for result in tool_results:
             if not result.success:
@@ -425,29 +506,14 @@ class Orchestrator:
 
             data = result.data or {}
 
-            # Check for buyer decisions
+            # Score = revenue from accepted plans
             decision = data.get("decision")
             if decision == "accept_plan":
-                score += scoring.accept_reward
-                # Bonus for close_now
                 offer = data.get("offer_presented", {})
-                if offer.get("next_step") == "close_now":
-                    score += scoring.close_now_bonus
-                # Premium-based bonus
                 premium = offer.get("monthly_premium", 0)
-                score += premium * scoring.premium_multiplier
+                revenue += premium
 
-            elif decision == "reject_plan":
-                score += scoring.reject_penalty
-
-            elif decision == "end_call":
-                score += scoring.end_call_penalty
-
-            # DNC violation
-            if data.get("dnc_violation"):
-                score += scoring.dnc_penalty
-
-        return score
+        return revenue
 
     def _record_tool_to_context(self, tool_call: ToolCall, result: ToolResult) -> None:
         """Record a tool call and result to the episode context.
@@ -563,6 +629,39 @@ class Orchestrator:
         if self._history:
             self._history[-1]["buyer_response"] = dialogue
 
+    def record_conversation_turn(self, tokens: int = 0) -> None:
+        """Record a conversation turn during an active call.
+
+        This tracks time cost for the seller-buyer conversation exchange.
+        Should be called when the seller speaks and the buyer responds
+        during an active call.
+
+        Args:
+            tokens: Number of tokens in this turn (for token-based tracking).
+        """
+        self._budget_tracker.record_conversation_turn(tokens)
+
+    def record_seller_tokens(self, input_tokens: int, output_tokens: int) -> None:
+        """Record seller LLM token usage for time tracking.
+
+        Args:
+            input_tokens: Number of input tokens.
+            output_tokens: Number of output tokens.
+        """
+        total_tokens = input_tokens + output_tokens
+        self._budget_tracker.record_inference(input_tokens, output_tokens)
+        self._budget_tracker.record_token_time(total_tokens)
+
+    def record_buyer_tokens(self, input_tokens: int, output_tokens: int) -> None:
+        """Record buyer LLM token usage for time tracking.
+
+        Args:
+            input_tokens: Number of input tokens.
+            output_tokens: Number of output tokens.
+        """
+        total_tokens = input_tokens + output_tokens
+        self._budget_tracker.record_token_time(total_tokens)
+
     def get_final_result(self) -> EpisodeResult:
         """Get the final result of the episode.
 
@@ -570,6 +669,7 @@ class Orchestrator:
             EpisodeResult with summary and metrics.
         """
         stats = self._env.state.stats
+        usage = self._budget_tracker.usage
 
         metrics = {
             "total_calls": stats.total_calls,
@@ -582,7 +682,15 @@ class Orchestrator:
             "acceptance_rate": (
                 stats.accepted_offers / max(1, stats.accepted_offers + stats.rejected_offers)
             ),
-            "days_used": self._env.state.time.current_day,
+            "hours_used": self._env.state.time.elapsed_hours,
+            # Revenue-based score (sum of monthly premiums from accepted plans)
+            "total_revenue": self._cumulative_score,
+            # Dual time metrics - always output both regardless of time_model
+            "action_based_minutes": usage.action_based_minutes,
+            "token_based_minutes": usage.token_based_minutes,
+            "time_model_used": self.config.budget.time_model,
+            "budget_minutes_used": self._budget_tracker.get_budget_minutes(),
+            "conversation_turns": usage.conversation_turns,
         }
 
         return EpisodeResult(

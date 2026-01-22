@@ -1,51 +1,51 @@
 """Budget tracking for SalesBench.
 
-Tracks and enforces:
-- Time budgets (days, hours)
-- Call budgets (per day, duration)
-- Tool call budgets (per turn)
-- Inference cost budgets
+Tracks time usage - the only natural constraint in the simulation.
 """
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from salesbench.core.config import BudgetConfig
-from salesbench.core.errors import BudgetExceeded
 
 
 @dataclass
 class BudgetUsage:
-    """Tracks current budget usage."""
+    """Tracks current usage."""
 
     # Time usage
-    elapsed_days: int = 0
     elapsed_hours: int = 0
-    elapsed_minutes: int = 0
+    elapsed_minutes: int = 0  # Minutes within current hour (0-59)
+    total_elapsed_minutes: int = 0  # Total minutes elapsed
 
-    # Call usage
-    calls_today: int = 0
+    # Call stats (for metrics, not limits)
     calls_total: int = 0
     call_minutes_total: int = 0
 
-    # Tool usage
+    # Tool stats (for metrics, not limits)
     tool_calls_this_turn: int = 0
     tool_calls_total: int = 0
 
-    # Inference cost (optional)
+    # Inference cost tracking
     inference_tokens_input: int = 0
     inference_tokens_output: int = 0
+
+    # Dual time metrics (always tracked regardless of time_model)
+    action_based_minutes: float = 0.0  # Time from action costs
+    token_based_minutes: float = 0.0  # Time estimated from tokens
+
+    # Conversation turn tracking
+    conversation_turns: int = 0  # Total conversation turns during calls
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
             "time": {
-                "elapsed_days": self.elapsed_days,
                 "elapsed_hours": self.elapsed_hours,
                 "elapsed_minutes": self.elapsed_minutes,
+                "total_elapsed_minutes": self.total_elapsed_minutes,
             },
             "calls": {
-                "calls_today": self.calls_today,
                 "calls_total": self.calls_total,
                 "call_minutes_total": self.call_minutes_total,
             },
@@ -57,17 +57,22 @@ class BudgetUsage:
                 "tokens_input": self.inference_tokens_input,
                 "tokens_output": self.inference_tokens_output,
             },
+            "time_metrics": {
+                "action_based_minutes": self.action_based_minutes,
+                "token_based_minutes": self.token_based_minutes,
+                "conversation_turns": self.conversation_turns,
+            },
         }
 
 
 class BudgetTracker:
-    """Tracks and enforces budget limits."""
+    """Tracks time and usage metrics."""
 
     def __init__(self, config: BudgetConfig):
         """Initialize the budget tracker.
 
         Args:
-            config: Budget configuration with limits.
+            config: Budget configuration (time settings).
         """
         self.config = config
         self.usage = BudgetUsage()
@@ -80,33 +85,23 @@ class BudgetTracker:
         """Reset per-turn counters."""
         self.usage.tool_calls_this_turn = 0
 
-    def reset_day(self) -> None:
-        """Reset per-day counters."""
-        self.usage.calls_today = 0
-
-    def record_time(self, day: int, hour: int, minute: int) -> None:
+    def record_time(self, elapsed_hours: int, elapsed_minutes: int) -> None:
         """Record current time.
 
         Args:
-            day: Current day (1-10).
-            hour: Current hour (9-17).
-            minute: Current minute (0-59).
+            elapsed_hours: Total elapsed hours.
+            elapsed_minutes: Minutes within current hour (0-59).
         """
-        self.usage.elapsed_days = day - 1
-        self.usage.elapsed_hours = (day - 1) * 8 + (hour - 9)
-        self.usage.elapsed_minutes = self.usage.elapsed_hours * 60 + minute
+        self.usage.elapsed_hours = elapsed_hours
+        self.usage.elapsed_minutes = elapsed_minutes
+        self.usage.total_elapsed_minutes = elapsed_hours * 60 + elapsed_minutes
 
     def record_call_start(self) -> None:
         """Record that a call was started."""
-        self.usage.calls_today += 1
         self.usage.calls_total += 1
 
     def record_call_end(self, duration_minutes: int) -> None:
-        """Record that a call ended.
-
-        Args:
-            duration_minutes: How long the call lasted.
-        """
+        """Record that a call ended."""
         self.usage.call_minutes_total += duration_minutes
 
     def record_tool_call(self) -> None:
@@ -115,131 +110,65 @@ class BudgetTracker:
         self.usage.tool_calls_total += 1
 
     def record_inference(self, input_tokens: int, output_tokens: int) -> None:
-        """Record inference token usage.
-
-        Args:
-            input_tokens: Number of input tokens.
-            output_tokens: Number of output tokens.
-        """
+        """Record inference token usage."""
         self.usage.inference_tokens_input += input_tokens
         self.usage.inference_tokens_output += output_tokens
 
-    def check_time_budget(self) -> Optional[str]:
-        """Check if time budget is exceeded.
-
-        Returns:
-            Error message if exceeded, None otherwise.
-        """
-        if self.usage.elapsed_days >= self.config.total_days:
-            return f"Time budget exceeded: {self.config.total_days} days"
-        return None
-
-    def check_call_budget(self) -> Optional[str]:
-        """Check if daily call budget is exceeded.
-
-        Returns:
-            Error message if exceeded, None otherwise.
-        """
-        if self.usage.calls_today >= self.config.max_calls_per_day:
-            return f"Daily call limit reached: {self.config.max_calls_per_day}"
-        return None
-
-    def check_tool_budget(self) -> Optional[str]:
-        """Check if tool call budget for this turn is exceeded.
-
-        Returns:
-            Error message if exceeded, None otherwise.
-        """
-        if self.usage.tool_calls_this_turn >= self.config.max_tool_calls_per_turn:
-            return f"Tool call limit reached: {self.config.max_tool_calls_per_turn}"
-        return None
-
-    def check_call_duration(self, current_duration: int) -> Optional[str]:
-        """Check if call duration limit is exceeded.
+    def record_action_time(self, minutes: float) -> None:
+        """Record time for an action (action-based time model).
 
         Args:
-            current_duration: Current call duration in minutes.
+            minutes: Time cost in minutes for the action.
+        """
+        self.usage.action_based_minutes += minutes
+
+    def record_token_time(self, tokens: int) -> None:
+        """Record time based on token usage (token-based time model).
+
+        Args:
+            tokens: Number of tokens used.
+        """
+        self.usage.token_based_minutes += tokens / self.config.tokens_per_minute
+
+    def record_conversation_turn(self, tokens: int = 0) -> None:
+        """Record a conversation turn during an active call.
+
+        This tracks time cost for the conversation exchange.
+
+        Args:
+            tokens: Number of tokens in this turn (for token-based tracking).
+        """
+        self.usage.conversation_turns += 1
+        # Action-based: fixed cost per turn
+        self.usage.action_based_minutes += self.config.conversation_turn_cost
+        # Token-based: cost based on token count
+        if tokens > 0:
+            self.usage.token_based_minutes += tokens / self.config.tokens_per_minute
+
+    def get_budget_minutes(self) -> float:
+        """Get the budget minutes based on the active time model.
 
         Returns:
-            Error message if exceeded, None otherwise.
+            The minutes used according to the configured time model.
         """
-        if current_duration >= self.config.max_call_duration_minutes:
-            return f"Call duration limit reached: {self.config.max_call_duration_minutes} minutes"
-        return None
+        if self.config.time_model == "token":
+            return self.usage.token_based_minutes
+        return self.usage.action_based_minutes
 
-    def check_all(self) -> Optional[str]:
-        """Check all budgets.
+    def is_time_exceeded(self) -> bool:
+        """Check if time budget is exceeded."""
+        return self.usage.elapsed_hours >= self.config.total_hours
 
-        Returns:
-            First error message found, or None if all OK.
-        """
-        checks = [
-            self.check_time_budget(),
-            self.check_call_budget(),
-            self.check_tool_budget(),
-        ]
-        for check in checks:
-            if check:
-                return check
-        return None
-
-    def enforce_tool_call(self) -> None:
-        """Enforce tool call budget, raising if exceeded.
-
-        Raises:
-            BudgetExceeded: If tool call limit exceeded.
-        """
-        error = self.check_tool_budget()
-        if error:
-            raise BudgetExceeded(
-                error,
-                budget_type="tool_calls_per_turn",
-                limit=self.config.max_tool_calls_per_turn,
-                current=self.usage.tool_calls_this_turn,
-            )
-
-    def enforce_call_start(self) -> None:
-        """Enforce call start budget, raising if exceeded.
-
-        Raises:
-            BudgetExceeded: If daily call limit exceeded.
-        """
-        error = self.check_call_budget()
-        if error:
-            raise BudgetExceeded(
-                error,
-                budget_type="calls_per_day",
-                limit=self.config.max_calls_per_day,
-                current=self.usage.calls_today,
-            )
-
-    def get_remaining(self) -> dict[str, Any]:
-        """Get remaining budget amounts.
-
-        Returns:
-            Dict with remaining amounts for each budget type.
-        """
-        return {
-            "days_remaining": self.config.total_days - self.usage.elapsed_days,
-            "calls_remaining_today": self.config.max_calls_per_day - self.usage.calls_today,
-            "tool_calls_remaining_this_turn": (
-                self.config.max_tool_calls_per_turn - self.usage.tool_calls_this_turn
-            ),
-        }
+    def get_remaining_hours(self) -> int:
+        """Get remaining hours."""
+        return max(0, self.config.total_hours - self.usage.elapsed_hours)
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary.
-
-        Returns:
-            Dict with usage and remaining amounts.
-        """
+        """Convert to dictionary."""
         return {
             "usage": self.usage.to_dict(),
-            "remaining": self.get_remaining(),
-            "limits": {
-                "total_days": self.config.total_days,
-                "max_calls_per_day": self.config.max_calls_per_day,
-                "max_call_duration_minutes": self.config.max_call_duration_minutes,
-                "max_tool_calls_per_turn": self.config.max_tool_calls_per_turn,
-            },
+            "total_hours": self.config.total_hours,
+            "hours_remaining": self.get_remaining_hours(),
+            "time_model": self.config.time_model,
+            "budget_minutes_used": self.get_budget_minutes(),
         }

@@ -7,8 +7,6 @@ Buyer Agents:
 
 Seller Agents:
 - LLMSellerAgent: LLM-based seller using OpenAI/Anthropic
-- StreamingLLMSellerAgent: Streaming variant
-- ReActSellerAgent: ReAct-style reasoning agent
 - HeuristicSeller: Deterministic baseline agent (no API calls)
 """
 
@@ -21,7 +19,6 @@ from salesbench.agents.buyer_llm import (
 
 # Seller base
 from salesbench.agents.seller_base import (
-    MultiAgentSeller,
     SellerAgent,
     SellerConfig,
     SellerObservation,
@@ -36,8 +33,6 @@ from salesbench.agents.seller_heuristic import (
 # LLM sellers
 from salesbench.agents.seller_llm import (
     LLMSellerAgent,
-    ReActSellerAgent,
-    StreamingLLMSellerAgent,
 )
 
 __all__ = [
@@ -49,11 +44,8 @@ __all__ = [
     "SellerAgent",
     "SellerObservation",
     "SellerConfig",
-    "MultiAgentSeller",
     # LLM sellers
     "LLMSellerAgent",
-    "StreamingLLMSellerAgent",
-    "ReActSellerAgent",
     # Heuristic sellers
     "HeuristicSeller",
     "create_heuristic_seller",

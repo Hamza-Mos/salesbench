@@ -11,16 +11,35 @@ Context managers use ModelConfig to determine compression thresholds dynamically
 based on each model's actual context window size.
 """
 
+import asyncio
+import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-from salesbench.context.buffers import KeyEventBuffer, Message, SimpleCompactBuffer
+from salesbench.context.anchored_state import (
+    AnchoredState,
+    DecisionRecord,
+    LeadSummary,
+)
+from salesbench.context.buffers import LLMCompactBuffer, Message
 from salesbench.core.types import PlanOffer
-from salesbench.models import ModelConfig, get_model_config
+from salesbench.models import ModelConfig
+
+# Re-export for backwards compatibility
+__all__ = [
+    "AnchoredState",
+    "LeadSummary",
+    "DecisionRecord",
+    "LeadConversation",
+    "BaseContextManager",
+    "SellerContextManager",
+    "BuyerContextManager",
+    "EpisodeContext",
+]
 
 
 @dataclass
@@ -44,162 +63,6 @@ class LeadConversation:
     call_count: int = 0
 
 
-@dataclass
-class LeadSummary:
-    """Minimal lead info that survives compaction."""
-
-    lead_id: str
-    name: str
-    temperature: str
-    income: int
-    found_at_turn: int
-
-
-@dataclass
-class DecisionRecord:
-    """Record of a buyer decision."""
-
-    lead_id: str
-    decision: str  # "accept_plan", "reject_plan", "end_call"
-    turn: int
-
-
-@dataclass
-class AnchoredState:
-    """Critical state that survives compaction - injected fresh each turn.
-
-    This solves the problem of search results being lost during context compression.
-    Instead of relying on message history, we maintain a separate state that is
-    always injected at the start of the seller's view.
-    """
-
-    found_leads: dict[str, LeadSummary] = field(default_factory=dict)
-    decisions: list[DecisionRecord] = field(default_factory=list)
-    accepted_lead_ids: set[str] = field(default_factory=set)
-    called_lead_ids: set[str] = field(default_factory=set)
-    current_turn: int = 0
-    # Track the currently active call
-    active_call_lead_id: Optional[str] = None
-    active_call_lead_name: Optional[str] = None
-    # Track searched temperatures to avoid redundant searches
-    searched_temperatures: set[str] = field(default_factory=set)
-    # Protocol warnings (e.g., repeated propose_plan without message)
-    protocol_warnings: list[str] = field(default_factory=list)
-
-    def record_search(self, filters: dict) -> None:
-        """Record that a search was performed with given filters."""
-        if temp := filters.get("temperature"):
-            self.searched_temperatures.add(temp)
-
-    def record_search_results(self, leads: list[dict], turn: int) -> None:
-        """Anchor leads found - these survive any compaction."""
-        for lead in leads:
-            lead_id = lead.get("lead_id")
-            if lead_id and lead_id not in self.accepted_lead_ids:
-                self.found_leads[lead_id] = LeadSummary(
-                    lead_id=lead_id,
-                    name=lead.get("name", "Unknown"),
-                    temperature=lead.get("temperature", "unknown"),
-                    income=lead.get("annual_income", 0),
-                    found_at_turn=turn,
-                )
-            # Track the temperature that was searched
-            if temp := lead.get("temperature"):
-                self.searched_temperatures.add(temp)
-
-    def record_call_started(self, lead_id: str, lead_name: str = "Unknown") -> None:
-        """Record that a call was started with a lead."""
-        self.called_lead_ids.add(lead_id)
-        self.active_call_lead_id = lead_id
-        self.active_call_lead_name = lead_name
-
-    def record_call_ended(self, lead_id: str) -> None:
-        """Record that a call ended."""
-        if self.active_call_lead_id == lead_id:
-            self.active_call_lead_id = None
-            self.active_call_lead_name = None
-
-    def record_decision(self, lead_id: str, decision: str, turn: int) -> None:
-        """Record a buyer's decision."""
-        self.decisions.append(DecisionRecord(lead_id, decision, turn))
-        if decision == "accept_plan":
-            self.accepted_lead_ids.add(lead_id)
-            self.found_leads.pop(lead_id, None)
-        # Call ends after any decision
-        self.record_call_ended(lead_id)
-
-    def get_uncalled_leads(self) -> list[LeadSummary]:
-        """Get leads that haven't been called yet."""
-        return [
-            l
-            for l in self.found_leads.values()
-            if l.lead_id not in self.called_lead_ids and l.lead_id not in self.accepted_lead_ids
-        ]
-
-    def add_protocol_warning(self, warning: str) -> None:
-        """Add a protocol warning (deduplicated)."""
-        if warning not in self.protocol_warnings:
-            self.protocol_warnings.append(warning)
-
-    def clear_protocol_warnings(self) -> None:
-        """Clear all protocol warnings."""
-        self.protocol_warnings.clear()
-
-    def to_context_block(self) -> str:
-        """Generate context block injected at start of every seller view.
-
-        Shows facts clearly - no directive language. The model decides based on context.
-        """
-        lines = []
-
-        # PROTOCOL WARNINGS - always show at top (survives context compression)
-        if self.protocol_warnings:
-            lines.append("!!! PROTOCOL WARNINGS !!!")
-            for warning in self.protocol_warnings:
-                lines.append(f"  - {warning}")
-            lines.append("")
-
-        # ACTIVE CALL STATUS - just the fact
-        if self.active_call_lead_id:
-            lines.append(f"ACTIVE CALL: {self.active_call_lead_name} ({self.active_call_lead_id})")
-            lines.append("")
-
-        # AVAILABLE LEADS (uncalled from found_leads)
-        uncalled = self.get_uncalled_leads()
-        if uncalled:
-            lines.append(f"AVAILABLE LEADS ({len(uncalled)}):")
-            for lead in uncalled:
-                lines.append(
-                    f"  {lead.lead_id}: {lead.name} ({lead.temperature}, ${lead.income:,}/yr)"
-                )
-            lines.append("")
-
-        # SEARCH HISTORY - just show what was searched
-        if self.searched_temperatures:
-            lines.append(f"SEARCHED: {', '.join(sorted(self.searched_temperatures))}")
-
-        # COMPLETED
-        if self.accepted_lead_ids:
-            lines.append(f"ACCEPTED: {len(self.accepted_lead_ids)} leads")
-
-        # CALLED BUT NOT ACCEPTED
-        rejected = self.called_lead_ids - self.accepted_lead_ids
-        if rejected:
-            lines.append(f"CALLED (not accepted): {len(rejected)} leads")
-
-        return "\n".join(lines) if lines else ""
-
-    def prune_old_leads(self, current_turn: int, max_age: int = 50) -> None:
-        """Remove leads older than max_age turns that were never called."""
-        to_remove = [
-            lid
-            for lid, lead in self.found_leads.items()
-            if current_turn - lead.found_at_turn > max_age and lid not in self.called_lead_ids
-        ]
-        for lid in to_remove:
-            del self.found_leads[lid]
-
-
 class BaseContextManager(ABC):
     """Base class for model-aware context management."""
 
@@ -210,11 +73,6 @@ class BaseContextManager(ABC):
             model_config: Configuration for the model (context window, etc.)
         """
         self.model_config = model_config
-        self._buffer = KeyEventBuffer(
-            max_messages=200,
-            max_tokens=model_config.available_context,
-            key_event_priority=10,
-        )
 
     @property
     def compression_trigger(self) -> int:
@@ -222,29 +80,38 @@ class BaseContextManager(ABC):
         return self.model_config.compression_trigger
 
     @abstractmethod
-    def maybe_compress(self) -> None:
-        """Compress if threshold exceeded."""
+    async def maybe_compress(self) -> bool:
+        """Compress if threshold exceeded.
+
+        Returns:
+            True if compaction was performed, False otherwise.
+        """
         pass
 
+    @abstractmethod
     def token_count(self) -> int:
         """Get current token count estimate."""
-        return self._buffer.token_count()
+        pass
 
 
 class SellerContextManager(BaseContextManager):
-    """Manages seller's episode-wide context.
+    """Manages seller's episode-wide context with LLM compaction.
 
     Seller sees ALL conversations with ALL leads.
-    Uses SimpleCompactBuffer with observation masking (not summarization).
+    Uses LLMCompactBuffer for LLM-based summarization when context exceeds threshold.
     """
 
-    def __init__(self, model_config: ModelConfig):
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        compaction_fn: Optional[Callable[[str], Awaitable[str]]] = None,
+    ):
         self.model_config = model_config
-        # Use SimpleCompactBuffer with observation masking
-        self._buffer = SimpleCompactBuffer(
+        # Use LLMCompactBuffer with LLM-based compaction
+        self._buffer = LLMCompactBuffer(
             max_tokens=model_config.available_context,
-            keep_recent=20,
-            key_event_priority=10,
+            keep_recent=model_config.compaction_keep_recent,
+            compaction_fn=compaction_fn,
         )
         self._lead_conversations: dict[str, LeadConversation] = {}
 
@@ -253,21 +120,40 @@ class SellerContextManager(BaseContextManager):
         """Token count at which to trigger compression."""
         return self.model_config.compression_trigger
 
-    def maybe_compress(self) -> None:
-        """Compress when exceeding model's context threshold using observation masking."""
-        self._buffer.compact_if_needed(self.compression_trigger)
+    async def maybe_compress(self) -> bool:
+        """Compress when exceeding model's context threshold using LLM compaction.
+
+        Returns:
+            True if compaction was performed, False otherwise.
+        """
+        return await self._buffer.compact_if_needed(self.compression_trigger)
 
     def get_view(self) -> list[dict]:
-        """Get seller's full episode history (compressed)."""
-        self.maybe_compress()
-        return self._buffer.to_api_messages()
+        """Get seller's full episode history.
+
+        Note: Call maybe_compress() before this if async compaction is needed.
+
+        Returns:
+            List of message dicts in API format, with optional memory prefix.
+        """
+        messages = self._buffer.to_api_messages()
+
+        # Inject compacted memory if exists
+        memory = self._buffer.get_memory_prefix()
+        if memory:
+            messages.insert(
+                0,
+                {"role": "user", "content": f"[MEMORY - What You Remember]\n{memory}"},
+            )
+
+        return messages
 
     def add(self, message: Message) -> None:
         """Add a message to the buffer."""
         self._buffer.add(message)
 
     def add_key_event(self, content: str, role: str = "system") -> None:
-        """Add a key event that should be preserved during compression."""
+        """Add a key event message."""
         self._buffer.add_key_event(content, role=role)
 
     def token_count(self) -> int:
@@ -276,46 +162,102 @@ class SellerContextManager(BaseContextManager):
 
 
 class BuyerContextManager(BaseContextManager):
-    """Manages buyer's per-lead context.
+    """Manages buyer's per-lead context with LLM compaction.
 
     Buyer sees ONLY their own conversation with seller.
-    Uses model's actual context window instead of hardcoded 8K cap.
-    Simpler compression - just keep recent dialogue.
+    Uses LLM-based compaction when context exceeds threshold.
     """
 
-    def __init__(self, model_config: ModelConfig):
-        # Use model's actual context window (no artificial 8K cap)
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        compaction_fn: Optional[Callable[[str], Awaitable[str]]] = None,
+    ):
         super().__init__(model_config)
         self._dialogue: list[tuple[str, str]] = []  # (role, text)
+        self._compacted_memory: Optional[str] = None
+        self._compaction_fn = compaction_fn
+        self.keep_recent = model_config.compaction_keep_recent
 
-    def maybe_compress(self) -> None:
-        """Compress dialogue when exceeding threshold."""
-        tokens = self._estimate_tokens()
-        trigger = self.compression_trigger
+    async def maybe_compress(self) -> bool:
+        """Compress dialogue when exceeding threshold using LLM compaction.
 
-        if tokens > trigger:
-            # Keep last 4 turns minimum
-            while len(self._dialogue) > 4 and self._estimate_tokens() > trigger:
-                self._dialogue.pop(0)
-            print(f"  [Buyer Context] Compressed to {len(self._dialogue)} turns")
+        Returns:
+            True if compaction was performed, False otherwise.
+        """
+        current_tokens = self._estimate_tokens()
+        if current_tokens <= self.compression_trigger:
+            return False
+
+        if len(self._dialogue) <= self.keep_recent:
+            return False
+
+        before_turns = len(self._dialogue)
+        older = self._dialogue[: -self.keep_recent]
+        recent = self._dialogue[-self.keep_recent :]
+
+        logger.info(
+            f"[Buyer Context] COMPACTING: {current_tokens:,} > {self.compression_trigger:,} tokens "
+            f"({before_turns} turns)"
+        )
+
+        if self._compaction_fn:
+            older_text = self._format_dialogue(older)
+            self._compacted_memory = await self._compaction_fn(older_text)
+
+        self._dialogue = recent
+        after_tokens = self._estimate_tokens()
+
+        logger.info(
+            f"[Buyer Context] COMPACTED via LLM: {after_tokens:,} tokens "
+            f"({len(recent)} turns kept, {len(older)} turns summarized)"
+        )
+        return True
+
+    def _format_dialogue(self, dialogue: list[tuple[str, str]]) -> str:
+        """Format dialogue for compaction prompt."""
+        lines = []
+        for role, text in dialogue:
+            speaker = "Seller" if role == "seller" else "You"
+            lines.append(f'{speaker}: "{text}"')
+        return "\n".join(lines)
 
     def _estimate_tokens(self) -> int:
-        """Estimate token count for current dialogue."""
-        return sum(len(text) // 4 + 15 for _, text in self._dialogue)
+        """Estimate token count for current dialogue.
+
+        Uses consistent formula: len(content) // 4 + 10 (same as Message.token_estimate).
+        """
+        base = sum(len(text) // 4 + 10 for _, text in self._dialogue)
+        if self._compacted_memory:
+            base += len(self._compacted_memory) // 4 + 10
+        return base
 
     def add_dialogue(self, role: str, text: str) -> None:
         """Add a dialogue turn."""
         self._dialogue.append((role, text))
 
     def get_view(self) -> str:
-        """Get buyer's conversation history as formatted text."""
-        self.maybe_compress()
-        if not self._dialogue:
-            return "This is the first interaction with this seller."
-        lines = ["Conversation so far:"]
-        for role, text in self._dialogue:
-            speaker = "Seller" if role == "seller" else "You"
-            lines.append(f'  {speaker}: "{text}"')
+        """Get buyer's conversation history as formatted text.
+
+        Note: Call maybe_compress() before this if async compaction is needed.
+
+        Returns:
+            Formatted string of conversation history with optional memory prefix.
+        """
+        lines = []
+        if self._compacted_memory:
+            lines.append("## What You Remember From Earlier")
+            lines.append(self._compacted_memory)
+            lines.append("")
+
+        if self._dialogue:
+            lines.append("## Recent Conversation")
+            for role, text in self._dialogue:
+                speaker = "Seller" if role == "seller" else "You"
+                lines.append(f'  {speaker}: "{text}"')
+        elif not self._compacted_memory:
+            lines.append("This is the first interaction with this seller.")
+
         return "\n".join(lines)
 
     def token_count(self) -> int:
@@ -364,51 +306,33 @@ class EpisodeContext:
 
     def __init__(
         self,
-        seller_model_config: Optional[ModelConfig] = None,
-        buyer_model_config: Optional[ModelConfig] = None,
-        # Legacy parameters for backward compatibility
-        max_tokens: int = 6000,
-        compression_threshold: float = 0.8,
-        buyer_max_tokens: int = 2000,
+        seller_model_config: ModelConfig,
+        buyer_model_config: ModelConfig,
+        seller_compaction_fn: Optional[Callable[[str], Awaitable[str]]] = None,
+        buyer_compaction_fn: Optional[Callable[[str], Awaitable[str]]] = None,
     ):
         """Initialize the episode context.
 
         Args:
             seller_model_config: ModelConfig for seller model (determines context limits).
             buyer_model_config: ModelConfig for buyer model (determines context limits).
-            max_tokens: Legacy - Maximum tokens for seller context (used if no config).
-            compression_threshold: Legacy - Trigger compression at this % of max_tokens.
-            buyer_max_tokens: Legacy - Maximum tokens for each buyer's dialogue.
+            seller_compaction_fn: Optional async function for seller LLM compaction.
+            buyer_compaction_fn: Optional async function for buyer LLM compaction.
         """
-        # Use provided model configs or create defaults
-        if seller_model_config:
-            self._seller_model_config = seller_model_config
-        else:
-            # Legacy fallback - create a config from the old parameters
-            self._seller_model_config = ModelConfig(
-                context_window=max_tokens + 4000,  # Add buffer for system tokens
-                output_token_limit=2000,
-                provider="unknown",
-                compression_threshold=compression_threshold,
-            )
-
-        if buyer_model_config:
-            self._buyer_model_config = buyer_model_config
-        else:
-            # Legacy fallback
-            self._buyer_model_config = ModelConfig(
-                context_window=buyer_max_tokens + 4000,
-                output_token_limit=1000,
-                provider="unknown",
-                compression_threshold=compression_threshold,
-            )
+        self._seller_model_config = seller_model_config
+        self._buyer_model_config = buyer_model_config
+        self._seller_compaction_fn = seller_compaction_fn
+        self._buyer_compaction_fn = buyer_compaction_fn
 
         self._lead_conversations: dict[str, LeadConversation] = {}
 
-        # Create seller context manager
-        self._seller_manager = SellerContextManager(self._seller_model_config)
+        # Create seller context manager with compaction function
+        self._seller_manager = SellerContextManager(
+            self._seller_model_config,
+            compaction_fn=seller_compaction_fn,
+        )
 
-        # Buyer managers created per-lead
+        # Buyer managers created per-lead with buyer compaction function
         self._buyer_managers: dict[str, BuyerContextManager] = {}
 
         # Track current call for routing messages
@@ -417,12 +341,6 @@ class EpisodeContext:
 
         # Anchored state - critical info that survives compaction
         self._anchored_state = AnchoredState()
-
-        # Legacy compatibility - expose the buffer through seller manager
-        self._episode_buffer = self._seller_manager._buffer
-        self._max_tokens = self._seller_model_config.available_context
-        self._compression_threshold = self._seller_model_config.compression_threshold
-        self._buyer_max_tokens = self._buyer_model_config.available_context
 
     def _get_lead_conversation(self, lead_id: str) -> LeadConversation:
         """Get or create conversation for a lead."""
@@ -713,13 +631,18 @@ class EpisodeContext:
     def _get_buyer_manager(self, lead_id: str) -> BuyerContextManager:
         """Get or create buyer manager for a lead."""
         if lead_id not in self._buyer_managers:
-            self._buyer_managers[lead_id] = BuyerContextManager(self._buyer_model_config)
+            self._buyer_managers[lead_id] = BuyerContextManager(
+                self._buyer_model_config,
+                compaction_fn=self._buyer_compaction_fn,
+            )
         return self._buyer_managers[lead_id]
 
     # --- Views ---
 
     def get_seller_view(self) -> list[dict]:
-        """Get full episode history (compressed) for seller LLM.
+        """Get full episode history for seller LLM.
+
+        Note: Call trigger_seller_compaction() before this for async compaction.
 
         Injects anchored state at the start - always accurate, never lost to compaction.
 
@@ -730,6 +653,11 @@ class EpisodeContext:
         self._anchored_state.prune_old_leads(self._message_counter)
 
         messages = self._seller_manager.get_view()
+        token_count = self._seller_manager.token_count()
+
+        logger.debug(
+            f"[Seller View] Retrieved {len(messages)} messages, ~{token_count:,} tokens"
+        )
 
         # INJECT anchored state - always accurate, never lost to compaction
         anchored_block = self._anchored_state.to_context_block()
@@ -738,14 +666,88 @@ class EpisodeContext:
                 0,
                 {"role": "user", "content": f"[CURRENT STATE - Always Accurate]\n{anchored_block}"},
             )
+            logger.debug(
+                f"[Seller View] Injected AnchoredState: "
+                f"{len(self._anchored_state.found_leads)} leads, "
+                f"{len(self._anchored_state.called_lead_ids)} called, "
+                f"{len(self._anchored_state.accepted_lead_ids)} accepted, "
+                f"active_call={self._anchored_state.active_call_lead_id}"
+            )
 
         return messages
+
+    async def trigger_seller_compaction(self) -> bool:
+        """Trigger async compaction for seller's context if needed.
+
+        Call this before get_seller_view() when async compaction is required.
+
+        Returns:
+            True if compaction was performed, False otherwise.
+        """
+        return await self._seller_manager.maybe_compress()
+
+    def trigger_seller_compaction_sync(self) -> None:
+        """Trigger seller compaction from synchronous code.
+
+        Use this when calling from sync context (e.g., seller agent).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            if not loop.is_closed():
+                asyncio.create_task(self.trigger_seller_compaction())
+        except RuntimeError:
+            # Not in an event loop - skip compaction (it's optional optimization)
+            pass
+
+    def get_buyer_structured_context(self, lead_id: str) -> str:
+        """Extract structured decision history for a lead.
+
+        This provides a summary of rejections that survives context compression,
+        ensuring the buyer remembers their previous objections.
+
+        Args:
+            lead_id: The lead whose decision history to retrieve.
+
+        Returns:
+            Formatted string summarizing past decisions, or empty string if none.
+        """
+        lead_convo = self._lead_conversations.get(lead_id)
+        if not lead_convo:
+            return ""
+
+        # Count rejections and collect rejection details
+        rejections = [d for d in lead_convo.decisions if d.get("decision") == "reject_plan"]
+        if not rejections:
+            return ""
+
+        lines = ["## Your Decision History This Call"]
+        lines.append(f"- You have rejected {len(rejections)} offer(s) so far")
+
+        # Include rejected offer details if we have them
+        if lead_convo.offers_presented and rejections:
+            lines.append("- Rejected offers:")
+            # Match rejections with offers (they should align)
+            for i, rejection in enumerate(rejections):
+                reason = rejection.get("reason", "No specific reason")
+                dialogue = rejection.get("dialogue", "")
+                # Get corresponding offer if available
+                if i < len(lead_convo.offers_presented):
+                    offer = lead_convo.offers_presented[i]
+                    plan_type = offer.get("plan_id", "Unknown")
+                    premium = offer.get("monthly_premium", 0)
+                    lines.append(f'  * {plan_type} ${premium:.0f}/mo - "{dialogue or reason}"')
+                else:
+                    lines.append(f'  * Offer #{i+1} - "{dialogue or reason}"')
+
+        return "\n".join(lines)
 
     def get_buyer_view(self, lead_id: str) -> str:
         """Get this lead's conversation history only (formatted as text).
 
-        Uses BuyerContextManager for the lead if available, falls back to
-        legacy _format_lead_history for existing conversations.
+        Note: Call trigger_buyer_compaction() before this for async compaction.
+
+        Uses BuyerContextManager for the lead. Prepends structured decision history
+        to ensure the buyer remembers their objections even after context compression.
 
         Args:
             lead_id: The lead whose history to retrieve.
@@ -753,16 +755,31 @@ class EpisodeContext:
         Returns:
             Formatted string of this lead's conversation history.
         """
-        # Use buyer manager if it exists for this lead
-        if lead_id in self._buyer_managers:
-            return self._buyer_managers[lead_id].get_view()
+        # Get structured decision context (survives compression)
+        structured_context = self.get_buyer_structured_context(lead_id)
 
-        # Legacy fallback for conversations started before managers were added
-        if lead_id not in self._lead_conversations:
-            return "This is the first interaction with this seller."
+        # Get or create buyer manager for this lead
+        buyer_manager = self._get_buyer_manager(lead_id)
+        dialogue_view = buyer_manager.get_view()
 
-        convo = self._lead_conversations[lead_id]
-        return self._format_lead_history(convo)
+        # Combine: structured decisions first, then dialogue
+        if structured_context:
+            return f"{structured_context}\n\n{dialogue_view}"
+        return dialogue_view
+
+    async def trigger_buyer_compaction(self, lead_id: str) -> bool:
+        """Trigger async compaction for a buyer's context if needed.
+
+        Call this before get_buyer_view() when async compaction is required.
+
+        Args:
+            lead_id: The lead whose context to potentially compact.
+
+        Returns:
+            True if compaction was performed, False otherwise.
+        """
+        buyer_manager = self._get_buyer_manager(lead_id)
+        return await buyer_manager.maybe_compress()
 
     def get_token_count(self) -> int:
         """Get current token count estimate for seller view."""
@@ -786,37 +803,6 @@ class EpisodeContext:
         """
         self._seller_manager.maybe_compress()
 
-    def _summarize_messages(self, messages: list[Message]) -> str:
-        """Summarize a list of messages for compression.
-
-        Args:
-            messages: Messages to summarize.
-
-        Returns:
-            Summary string.
-        """
-        # Group by tool types for summary
-        tool_counts: dict[str, int] = {}
-        lead_mentions: set[str] = set()
-
-        for msg in messages:
-            if msg.metadata.get("tool_name"):
-                tool_name = msg.metadata["tool_name"]
-                tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
-            if msg.metadata.get("lead_id"):
-                lead_mentions.add(msg.metadata["lead_id"])
-
-        parts = []
-        if tool_counts:
-            tool_str = ", ".join(f"{k}({v})" for k, v in sorted(tool_counts.items()))
-            parts.append(f"Tool calls: {tool_str}")
-        if lead_mentions:
-            parts.append(f"Leads mentioned: {', '.join(sorted(lead_mentions))}")
-
-        if parts:
-            return f"[Summarized {len(messages)} earlier messages: {'; '.join(parts)}]"
-        return f"[Summarized {len(messages)} earlier messages]"
-
     def _format_tool_result(self, tool_name: str, result: dict) -> str:
         """Format a tool result for display.
 
@@ -828,8 +814,6 @@ class EpisodeContext:
             Formatted string.
         """
         # Truncate long results
-        import json
-
         try:
             result_str = json.dumps(result, default=str)
             if len(result_str) > 500:
@@ -838,94 +822,21 @@ class EpisodeContext:
         except Exception:
             return str(result)[:500]
 
-    def _estimate_dialogue_tokens(self, dialogue: list[tuple[str, str]]) -> int:
-        """Estimate token count for dialogue list.
-
-        Args:
-            dialogue: List of (role, text) tuples.
-
-        Returns:
-            Estimated token count.
-        """
-        total_chars = sum(len(text) + 15 for _, text in dialogue)  # +15 for role prefix overhead
-        return total_chars // 4  # ~4 chars per token
-
-    def _format_lead_history(self, convo: LeadConversation) -> str:
-        """Format a lead's conversation history for the buyer.
-
-        Only shows actual dialogue text - what the seller said and what the buyer said.
-        No system messages, CRM searches, or internal tool info.
-        Compresses when token limit is approached (consistent with seller compression).
-
-        Args:
-            convo: The lead's conversation record.
-
-        Returns:
-            Formatted history string with only dialogue.
-        """
-        if not convo.dialogue_only and not convo.offers_presented:
-            return "This is the first interaction with this seller."
-
-        lines = []
-
-        # Note if this is a repeat call
-        if convo.call_count > 1:
-            lines.append(f"This is call #{convo.call_count} with this seller.")
-            lines.append("")
-
-        # Get dialogue - compress if exceeding token threshold
-        dialogue = list(convo.dialogue_only)
-        threshold = self._buyer_max_tokens * self._compression_threshold
-
-        if self._estimate_dialogue_tokens(dialogue) > threshold:
-            # Remove older turns until under threshold, keeping at least recent messages
-            older_turns = []
-            original_tokens = self._estimate_dialogue_tokens(dialogue)
-            while (
-                len(dialogue) > 4  # Keep at least 4 recent turns
-                and self._estimate_dialogue_tokens(dialogue) > threshold
-            ):
-                older_turns.append(dialogue.pop(0))
-
-            if older_turns:
-                # Summarize what was removed
-                seller_count = sum(1 for role, _ in older_turns if role == "seller")
-                buyer_count = sum(1 for role, _ in older_turns if role == "buyer")
-                print(
-                    f"  [Context] Summarizing buyer context ({convo.lead_id}): {original_tokens} tokens > {threshold:.0f} threshold, "
-                    f"compressed {len(older_turns)} turns"
-                )
-                lines.append(
-                    f"[Earlier in conversation: {seller_count} seller messages, {buyer_count} of your responses - summarized]"
-                )
-                lines.append("")
-
-        # Format the dialogue
-        if dialogue:
-            lines.append("Conversation so far:")
-            for role, text in dialogue:
-                if role == "seller":
-                    lines.append(f'  Seller: "{text}"')
-                else:
-                    lines.append(f'  You: "{text}"')
-
-        # Summarize decisions made (without internal details)
-        if convo.decisions:
-            lines.append("")
-            rejected = sum(1 for d in convo.decisions if d.get("decision") == "reject_plan")
-            if rejected > 0:
-                lines.append(f"You have rejected {rejected} offer(s) from this seller.")
-
-        return "\n".join(lines)
-
     def reset(self) -> None:
         """Reset all context for a new episode."""
+        logger.info("[EpisodeContext] Resetting for new episode")
         self._lead_conversations.clear()
         self._buyer_managers.clear()
-        # Create fresh seller manager
-        self._seller_manager = SellerContextManager(self._seller_model_config)
-        self._episode_buffer = self._seller_manager._buffer
+        # Create fresh seller manager with compaction function
+        self._seller_manager = SellerContextManager(
+            self._seller_model_config,
+            compaction_fn=self._seller_compaction_fn,
+        )
         self._current_lead_id = None
         self._message_counter = 0
         # Reset anchored state
         self._anchored_state = AnchoredState()
+        logger.debug(
+            f"[EpisodeContext] Reset complete - "
+            f"Seller trigger: {self._seller_model_config.compression_trigger:,} tokens"
+        )

@@ -10,6 +10,46 @@ from typing import Any, Optional
 
 
 @dataclass
+class EpisodeProgress:
+    """Real-time progress update for an episode.
+
+    Sent after each turn to update progress displays.
+    """
+
+    episode_index: int
+    turn: int
+
+    # Time budget progress
+    elapsed_hours: int
+    elapsed_minutes: int
+    total_hours: int
+
+    # Lead progress
+    total_leads: int
+    leads_contacted: int
+    leads_converted: int
+    leads_dnc: int
+    leads_active: int
+
+    # Current state
+    in_call: bool = False
+    current_lead_id: Optional[str] = None
+
+    @property
+    def time_progress(self) -> float:
+        """Progress through time budget (0.0 to 1.0)."""
+        total_minutes = self.elapsed_hours * 60 + self.elapsed_minutes
+        budget_minutes = self.total_hours * 60
+        return min(1.0, total_minutes / budget_minutes) if budget_minutes > 0 else 0.0
+
+    @property
+    def lead_progress(self) -> float:
+        """Progress through leads (0.0 to 1.0)."""
+        resolved = self.leads_converted + self.leads_dnc
+        return resolved / self.total_leads if self.total_leads > 0 else 0.0
+
+
+@dataclass
 class TokenUsage:
     """Tracks token usage for cost estimation.
 
@@ -201,12 +241,12 @@ class EpisodeResult:
         episode_index: Zero-based index within benchmark.
         seed: Random seed used for this episode.
         status: Execution status (completed, failed, timeout).
-        final_score: Final score from the episode.
+        final_score: Total revenue earned (sum of monthly premiums from accepted plans).
         total_turns: Number of turns executed.
         total_accepts: Number of accepted offers.
         total_rejects: Number of rejected offers.
         total_calls: Number of calls made.
-        dnc_violations: Number of DNC violations.
+        dnc_violations: Number of DNC violations (tracked as metric, not penalty).
         termination_reason: Why the episode ended.
         duration_seconds: Wall-clock duration.
         started_at: When episode started.
@@ -242,6 +282,11 @@ class EpisodeResult:
     def succeeded(self) -> bool:
         """Check if episode completed successfully."""
         return self.status == "completed" and self.error is None
+
+    @property
+    def total_revenue(self) -> float:
+        """Total revenue earned (alias for final_score)."""
+        return self.final_score
 
     @property
     def has_accepts(self) -> bool:
@@ -389,8 +434,6 @@ class BenchmarkResult:
 
         import statistics
 
-        from salesbench.metrics.pass_at_k import compute_pass_at_k
-
         scores = [e.final_score for e in completed]
         acceptance_rates = [e.acceptance_rate for e in completed]
         durations = [e.duration_seconds for e in completed]
@@ -411,6 +454,18 @@ class BenchmarkResult:
         for e in self.episode_results:
             total_cost = total_cost + e.cost_breakdown
 
+        # Extract time metrics from episode metrics
+        action_based_minutes = [
+            e.metrics.get("action_based_minutes", 0) for e in completed
+        ]
+        token_based_minutes = [
+            e.metrics.get("token_based_minutes", 0) for e in completed
+        ]
+        conversation_turns = [
+            e.metrics.get("conversation_turns", 0) for e in completed
+        ]
+        total_calls = [e.total_calls for e in completed]
+
         metrics = {
             "n_episodes": n,
             "completed_episodes": self.completed_episodes,
@@ -427,18 +482,26 @@ class BenchmarkResult:
             "std_acceptance_rate": statistics.stdev(acceptance_rates) if n > 1 else 0.0,
             "episodes_with_accepts": c,
             "episode_success_rate": c / n if n > 0 else 0.0,
-            # Pass@k metrics
-            "pass_at_1": compute_pass_at_k(n, c, 1),
-            "pass_at_5": compute_pass_at_k(n, c, 5) if n >= 5 else None,
-            "pass_at_10": compute_pass_at_k(n, c, 10) if n >= 10 else None,
-            "pass_at_100": compute_pass_at_k(n, c, 100) if n >= 100 else None,
             # Timing
             "total_duration_seconds": sum(durations),
             "mean_episode_duration": statistics.mean(durations),
+            # Time metrics (new)
+            "mean_action_based_minutes": statistics.mean(action_based_minutes) if action_based_minutes else 0,
+            "mean_token_based_minutes": statistics.mean(token_based_minutes) if token_based_minutes else 0,
+            "mean_conversation_turns": statistics.mean(conversation_turns) if conversation_turns else 0,
+            "mean_calls": statistics.mean(total_calls) if total_calls else 0,
+            "mean_offers": self.total_accepts / n if n > 0 else 0,
             # Token usage
             "total_token_usage": total_tokens.to_dict(),
             # Cost breakdown
             "total_cost_breakdown": total_cost.to_dict(),
+            # DNC and compliance metrics
+            "total_dnc_violations": sum(e.dnc_violations for e in completed),
+            "mean_dnc_violations": sum(e.dnc_violations for e in completed) / n if n > 0 else 0,
+            # End call metrics
+            "total_end_calls": sum(e.metrics.get("end_calls", 0) for e in completed),
+            # Conversion rate (accepts / total calls)
+            "conversion_rate": self.total_accepts / sum(e.total_calls for e in completed) if sum(e.total_calls for e in completed) > 0 else 0,
         }
 
         self.aggregate_metrics = metrics

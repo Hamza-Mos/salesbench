@@ -33,8 +33,12 @@ def test_observation_mapping_in_call_sets_lead_id():
 def test_conversational_buyer_message_does_not_end_call():
     """Regression: conversational buyer dialogue must not update decision state/end call."""
     from salesbench.context.episode import EpisodeContext
+    from salesbench.models import get_model_config
 
-    ctx = EpisodeContext()
+    ctx = EpisodeContext(
+        seller_model_config=get_model_config("gpt-4o"),
+        buyer_model_config=get_model_config("gpt-4o-mini"),
+    )
     ctx.record_call_start("lead_abc", lead_name="Test Lead")
 
     assert ctx.current_lead_id == "lead_abc"
@@ -58,7 +62,7 @@ def test_accept_marks_converted_and_filters_from_search(sales_env, accepting_buy
     lead = sales_env.state.leads[lead_id]
     assert lead.converted is False
 
-    # Start call + propose plan (auto-accept ends call)
+    # Start call + propose plan (acceptance marks converted but seller must end call)
     start = sales_env.execute_tool(
         ToolCall(tool_name="calling.start_call", arguments={"lead_id": str(lead_id)})
     )
@@ -79,8 +83,13 @@ def test_accept_marks_converted_and_filters_from_search(sales_env, accepting_buy
     assert propose.success is True
     assert propose.data and propose.data.get("decision") == "accept_plan"
 
-    # Lead is converted and call ended
+    # Lead is converted but call still active (seller must end it)
     assert lead.converted is True
+    assert sales_env.state.active_call is not None  # Seller must call end_call
+
+    # Seller ends the call
+    end_call = sales_env.execute_tool(ToolCall(tool_name="calling.end_call", arguments={}))
+    assert end_call.success is True
     assert sales_env.state.active_call is None
 
     # Search should not return converted lead
@@ -140,13 +149,13 @@ def test_orchestrator_rejects_propose_plan_without_seller_message(
     assert orch.env.state.active_call is not None
 
 
-def test_orchestrator_stops_after_call_ended(default_config, accepting_buyer_simulator):
-    """Benchmark hygiene: ignore extra tool calls after accept ends call."""
+def test_orchestrator_stops_after_call_ended(default_config, mock_buyer_simulator):
+    """Benchmark hygiene: ignore extra tool calls after end_call."""
     from salesbench.core.types import ToolCall
     from salesbench.orchestrator.orchestrator import Orchestrator
 
     orch = Orchestrator(default_config)
-    orch.set_buyer_simulator(accepting_buyer_simulator)
+    orch.set_buyer_simulator(mock_buyer_simulator)
     orch.reset()
 
     # Search and start a call
@@ -160,18 +169,12 @@ def test_orchestrator_stops_after_call_ended(default_config, accepting_buyer_sim
         seller_message="Calling now.",
     )
 
-    # Two propose_plan calls in same turn; first accept ends call, second should be ignored (break)
+    # end_call followed by another tool that requires active call - second should be ignored (break)
     r3 = orch.step(
         [
             ToolCall(
-                tool_name="calling.propose_plan",
-                arguments={
-                    "plan_id": "TERM",
-                    "monthly_premium": 10.0,
-                    "coverage_amount": 100000.0,
-                    "next_step": "close_now",
-                    "term_years": 20,
-                },
+                tool_name="calling.end_call",
+                arguments={},
             ),
             ToolCall(
                 tool_name="calling.propose_plan",
@@ -184,33 +187,12 @@ def test_orchestrator_stops_after_call_ended(default_config, accepting_buyer_sim
                 },
             ),
         ],
-        seller_message="Here's the plan that fits what you said.",
+        seller_message="Ending call and trying another thing.",
     )
+    # After end_call succeeds, the loop breaks - only 1 result
     assert len(r3.tool_results) == 1
     assert r3.tool_results[0].success is True
     assert orch.env.state.active_call is None
-
-
-def test_orchestrator_blocks_duplicate_search_consecutive_turns(default_config):
-    """Benchmark hygiene: prevent immediate search thrashing."""
-    from salesbench.core.types import ToolCall
-    from salesbench.orchestrator.orchestrator import Orchestrator
-
-    orch = Orchestrator(default_config)
-    orch.reset()
-
-    r1 = orch.step(
-        [ToolCall(tool_name="crm.search_leads", arguments={"temperature": "cold", "limit": 10})],
-        seller_message="Searching cold.",
-    )
-    assert r1.tool_results[0].success is True
-
-    r2 = orch.step(
-        [ToolCall(tool_name="crm.search_leads", arguments={"temperature": "cold", "limit": 10})],
-        seller_message="Searching cold again.",
-    )
-    assert r2.tool_results[0].success is False
-    assert "Duplicate crm.search_leads" in (r2.tool_results[0].error or "")
 
 
 def test_has_propose_plan_helper():

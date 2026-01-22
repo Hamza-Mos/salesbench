@@ -30,6 +30,7 @@ class ModelConfig:
     reserved_system_tokens: int = 2000
     input_price_per_million: Optional[float] = None  # $ per 1M input tokens
     output_price_per_million: Optional[float] = None  # $ per 1M output tokens
+    compaction_keep_recent: int = 10  # Recent messages to keep verbatim during compaction
 
     @property
     def available_context(self) -> int:
@@ -47,91 +48,139 @@ SUPPORTED_MODELS: dict[str, ModelConfig] = {
     # ============= OpenAI (Frontier) =============
     # GPT-5.2 series (latest - 400K context)
     "gpt-5.2": ModelConfig(
-        400_000, 128_000, "openai", input_price_per_million=1.75, output_price_per_million=14.00
+        400_000, 128_000, "openai",
+        input_price_per_million=1.75, output_price_per_million=14.00,
+        compaction_keep_recent=15,
     ),
     "gpt-5-mini": ModelConfig(
-        400_000, 128_000, "openai", input_price_per_million=0.25, output_price_per_million=2.00
+        400_000, 128_000, "openai",
+        input_price_per_million=0.25, output_price_per_million=2.00,
+        compaction_keep_recent=8,
     ),
     "gpt-5-nano": ModelConfig(
-        128_000, 16_384, "openai", input_price_per_million=0.05, output_price_per_million=0.40
+        128_000, 16_384, "openai",
+        input_price_per_million=0.05, output_price_per_million=0.40,
+        compaction_keep_recent=6,
     ),
     # GPT-5 series
     "gpt-5": ModelConfig(
-        400_000, 128_000, "openai", input_price_per_million=1.25, output_price_per_million=10.00
+        400_000, 128_000, "openai",
+        input_price_per_million=1.25, output_price_per_million=10.00,
+        compaction_keep_recent=15,
     ),
     # O-series reasoning (latest)
     "o4-mini": ModelConfig(
-        200_000, 100_000, "openai", input_price_per_million=1.10, output_price_per_million=4.40
+        200_000, 100_000, "openai",
+        input_price_per_million=1.10, output_price_per_million=4.40,
+        compaction_keep_recent=8,
     ),
     "o3": ModelConfig(
-        200_000, 100_000, "openai", input_price_per_million=2.00, output_price_per_million=8.00
+        200_000, 100_000, "openai",
+        input_price_per_million=2.00, output_price_per_million=8.00,
+        compaction_keep_recent=12,
     ),
     "o3-pro": ModelConfig(
-        200_000, 100_000, "openai", input_price_per_million=20.00, output_price_per_million=80.00
+        200_000, 100_000, "openai",
+        input_price_per_million=20.00, output_price_per_million=80.00,
+        compaction_keep_recent=15,
     ),
     # GPT-4o (kept for buyer model - cost efficient)
     "gpt-4o": ModelConfig(
-        128_000, 16_384, "openai", input_price_per_million=2.50, output_price_per_million=10.00
+        128_000, 16_384, "openai",
+        input_price_per_million=2.50, output_price_per_million=10.00,
+        compaction_keep_recent=10,
     ),
     "gpt-4o-mini": ModelConfig(
-        128_000, 16_384, "openai", input_price_per_million=0.15, output_price_per_million=0.60
+        128_000, 16_384, "openai",
+        input_price_per_million=0.15, output_price_per_million=0.60,
+        compaction_keep_recent=6,
     ),
     # ============= Anthropic (Frontier) =============
     # Claude 4.5 series (latest)
     "claude-opus-4-5-20251101": ModelConfig(
-        200_000, 64_000, "anthropic", input_price_per_million=5.00, output_price_per_million=25.00
+        200_000, 64_000, "anthropic",
+        input_price_per_million=5.00, output_price_per_million=25.00,
+        compaction_keep_recent=15,
     ),
     "claude-sonnet-4-5-20250929": ModelConfig(
-        200_000, 64_000, "anthropic", input_price_per_million=3.00, output_price_per_million=15.00
+        200_000, 64_000, "anthropic",
+        input_price_per_million=3.00, output_price_per_million=15.00,
+        compaction_keep_recent=12,
     ),
     "claude-haiku-4-5-20251001": ModelConfig(
-        200_000, 64_000, "anthropic", input_price_per_million=1.00, output_price_per_million=5.00
+        200_000, 64_000, "anthropic",
+        input_price_per_million=1.00, output_price_per_million=5.00,
+        compaction_keep_recent=8,
     ),
     # ============= Google Gemini (Frontier) =============
-    # Gemini 3 series (latest)
-    "gemini-3-pro": ModelConfig(
-        1_048_576, 65_536, "google", input_price_per_million=2.00, output_price_per_million=12.00
+    # Gemini 3 series (latest - in preview)
+    "gemini-3-pro-preview": ModelConfig(
+        1_048_576, 65_536, "google",
+        input_price_per_million=2.00, output_price_per_million=12.00,
+        compaction_keep_recent=15,
     ),
-    "gemini-3-flash": ModelConfig(
-        1_048_576, 65_536, "google", input_price_per_million=0.50, output_price_per_million=3.00
+    "gemini-3-flash-preview": ModelConfig(
+        1_048_576, 65_536, "google",
+        input_price_per_million=0.50, output_price_per_million=3.00,
+        compaction_keep_recent=10,
     ),
     # Gemini 2.5 series
     "gemini-2.5-pro": ModelConfig(
-        1_048_576, 65_536, "google", input_price_per_million=1.25, output_price_per_million=10.00
+        1_048_576, 65_536, "google",
+        input_price_per_million=1.25, output_price_per_million=10.00,
+        compaction_keep_recent=15,
     ),
     "gemini-2.5-flash": ModelConfig(
-        1_048_576, 65_536, "google", input_price_per_million=0.30, output_price_per_million=2.50
+        1_048_576, 65_536, "google",
+        input_price_per_million=0.30, output_price_per_million=2.50,
+        compaction_keep_recent=10,
     ),
     # ============= xAI Grok (Frontier) =============
     # Grok 4 series (latest - 2M context)
     "grok-4-1-fast": ModelConfig(
-        2_000_000, 8_000, "xai", input_price_per_million=0.20, output_price_per_million=0.50
+        2_000_000, 8_000, "xai",
+        input_price_per_million=0.20, output_price_per_million=0.50,
+        compaction_keep_recent=15,
     ),
     # ============= Open Source via OpenRouter/Together (Frontier) =============
     # DeepSeek (latest)
     "deepseek-v3.2": ModelConfig(
-        128_000, 8_192, "openrouter", input_price_per_million=0.28, output_price_per_million=0.42
+        128_000, 8_192, "openrouter",
+        input_price_per_million=0.28, output_price_per_million=0.42,
+        compaction_keep_recent=10,
     ),
     "deepseek-v3.2-speciale": ModelConfig(
-        128_000, 8_192, "openrouter", input_price_per_million=0.28, output_price_per_million=0.42
+        128_000, 8_192, "openrouter",
+        input_price_per_million=0.28, output_price_per_million=0.42,
+        compaction_keep_recent=10,
     ),
     "deepseek-r1": ModelConfig(
-        128_000, 8_192, "openrouter", input_price_per_million=0.55, output_price_per_million=2.19
+        128_000, 8_192, "openrouter",
+        input_price_per_million=0.55, output_price_per_million=2.19,
+        compaction_keep_recent=10,
     ),
     # Llama 3.3 (latest stable)
     "llama-3.3-70b-instruct": ModelConfig(
-        131_000, 4_096, "openrouter", input_price_per_million=0.10, output_price_per_million=0.32
+        131_000, 4_096, "openrouter",
+        input_price_per_million=0.10, output_price_per_million=0.32,
+        compaction_keep_recent=10,
     ),
     # Qwen3 (latest)
     "qwen3-coder-480b": ModelConfig(
-        256_000, 32_768, "openrouter", input_price_per_million=0.22, output_price_per_million=0.95
+        256_000, 32_768, "openrouter",
+        input_price_per_million=0.22, output_price_per_million=0.95,
+        compaction_keep_recent=12,
     ),
     "qwen3-235b-a22b": ModelConfig(
-        262_000, 16_384, "openrouter", input_price_per_million=0.45, output_price_per_million=3.50
+        262_000, 16_384, "openrouter",
+        input_price_per_million=0.45, output_price_per_million=3.50,
+        compaction_keep_recent=12,
     ),
     # GLM (latest)
     "glm-4.6": ModelConfig(
-        200_000, 8_192, "openrouter", input_price_per_million=0.35, output_price_per_million=1.55
+        200_000, 8_192, "openrouter",
+        input_price_per_million=0.35, output_price_per_million=1.55,
+        compaction_keep_recent=10,
     ),
 }
 
@@ -140,15 +189,12 @@ KNOWN_MODELS: dict[str, str] = {
     model: config.provider for model, config in SUPPORTED_MODELS.items()
 }
 
-# Models to benchmark by default (representative set)
+# Models to benchmark by default (representative frontier set)
 # Format: provider/model
 DEFAULT_BENCHMARK_MODELS: list[str] = [
-    "openai/gpt-4o",
-    "openai/gpt-4o-mini",
-    "anthropic/claude-sonnet-4-20250514",
-    "anthropic/claude-3-5-haiku-20241022",
-    "google/gemini-1.5-pro",
-    "google/gemini-1.5-flash",
+    "openai/gpt-5.2",
+    "anthropic/claude-opus-4-5-20251101",
+    "google/gemini-3-pro-preview",
 ]
 
 # Provider aliases for common shortcuts

@@ -115,12 +115,6 @@ class AggregateMetrics:
     episodes_with_accepts: int = 0
     success_rate: float = 0.0  # % episodes with at least one accept
 
-    # pass@k
-    pass_at_1: float = 0.0
-    pass_at_5: float = 0.0
-    pass_at_10: float = 0.0
-    pass_at_100: float = 0.0
-
     # Timing
     total_duration_seconds: float = 0.0
     mean_episode_duration: float = 0.0
@@ -148,10 +142,6 @@ class AggregateMetrics:
             "mean_offers_per_call": self.mean_offers_per_call,
             "episodes_with_accepts": self.episodes_with_accepts,
             "success_rate": self.success_rate,
-            "pass_at_1": self.pass_at_1,
-            "pass_at_5": self.pass_at_5,
-            "pass_at_10": self.pass_at_10,
-            "pass_at_100": self.pass_at_100,
             "total_duration_seconds": self.total_duration_seconds,
             "mean_episode_duration": self.mean_episode_duration,
             "total_api_cost": self.total_api_cost,
@@ -350,11 +340,9 @@ class MetricCollector:
         # Count successful episodes
         episodes_with_accepts = sum(1 for e in self._episodes if e.total_accepts > 0)
 
-        # Compute pass@k
-        from salesbench.metrics.pass_at_k import compute_pass_at_k
-
-        # Success = any acceptance
-        c = episodes_with_accepts
+        # Pre-compute totals
+        total_calls = sum(calls)
+        total_offers = sum(e.total_offers for e in self._episodes)
 
         return AggregateMetrics(
             n_episodes=n,
@@ -370,15 +358,9 @@ class MetricCollector:
             total_revenue=sum(revenues),
             mean_calls=statistics.mean(calls),
             mean_call_duration=statistics.mean([e.avg_call_duration for e in self._episodes]),
-            mean_offers_per_call=sum(e.total_offers for e in self._episodes) / sum(calls)
-            if sum(calls) > 0
-            else 0,
+            mean_offers_per_call=total_offers / total_calls if total_calls > 0 else 0,
             episodes_with_accepts=episodes_with_accepts,
             success_rate=episodes_with_accepts / n,
-            pass_at_1=compute_pass_at_k(n, c, 1),
-            pass_at_5=compute_pass_at_k(n, c, 5),
-            pass_at_10=compute_pass_at_k(n, c, 10),
-            pass_at_100=compute_pass_at_k(n, c, 100) if n >= 100 else compute_pass_at_k(n, c, n),
             total_duration_seconds=sum(durations),
             mean_episode_duration=statistics.mean(durations),
             total_api_cost=sum(api_costs),

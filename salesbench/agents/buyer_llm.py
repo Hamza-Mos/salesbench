@@ -74,13 +74,22 @@ IMPORTANT: You must respond with ONLY a JSON object in this exact format:
 {
     "decision": "ACCEPT_PLAN" | "REJECT_PLAN" | "END_CALL",
     "reason": "Brief explanation (1-2 sentences)",
-    "dialogue": "What you actually say to the salesperson (1-3 sentences, in first person, conversational)"
+    "dialogue": "What you actually say to the salesperson (1-3 sentences, in first person, conversational)",
+    "request_dnc": true | false
 }
+
+Fields:
+- "decision": Your choice (required)
+- "reason": Why you made this decision (required)
+- "dialogue": What you verbally say to the salesperson (required)
+- "request_dnc": Set to true if you want to be put on the Do Not Call list (optional, default false)
 
 The "dialogue" field is what you verbally say to the salesperson. Make it natural and human:
 - For ACCEPT_PLAN: Express agreement, maybe mention what convinced you
 - For REJECT_PLAN: Voice your specific objection based on your persona's style
 - For END_CALL: Say goodbye or express frustration, depending on your mood
+
+Use "request_dnc": true when you never want to be contacted again (e.g., hostile leads, repeated unwanted calls).
 
 Base your decision on:
 - Your persona's financial situation (can you afford this?)
@@ -97,11 +106,21 @@ Guidelines for realistic behavior:
 - COLD leads: Not interested, rarely accept unless exceptional deal
 - HOSTILE leads: Do not want to be called, will end call quickly
 
+## When to END_CALL
+Real people don't stay on sales calls forever. Strongly consider END_CALL when:
+- Your patience is below 30% - you're running out of interest
+- You've rejected 3+ offers - the seller can't meet your needs
+- The seller keeps repeating similar offers you already rejected
+
+If patience is below 20%, END_CALL unless the offer is truly exceptional.
+If patience is below 10%, END_CALL - you've had enough.
+
 DO NOT:
 - Accept offers you cannot afford
 - Be unrealistically easy or difficult
 - Ignore your persona's characteristics
 - Accept on the first offer if you're a cold/hostile lead
+- Stay on the call indefinitely when your patience is low
 """
 
 
@@ -111,6 +130,7 @@ def create_buyer_prompt(
     session: CallSession,
     seller_pitch: Optional[str] = None,
     negotiation_history: Optional[str] = None,
+    rejection_count: int = 0,
 ) -> str:
     """Create the prompt for the buyer LLM.
 
@@ -120,6 +140,7 @@ def create_buyer_prompt(
         session: Current call session.
         seller_pitch: What the salesperson said when presenting the offer.
         negotiation_history: Optional history of previous conversations with this seller.
+        rejection_count: Number of offers this lead has rejected so far.
 
     Returns:
         Formatted prompt string.
@@ -155,7 +176,23 @@ You are a {persona.temperature.value.upper()} lead.
 
 ## Call Context
 - Offers presented so far: {len(session.offers_presented)}
-- Call duration: {session.duration_minutes} minutes
+- Offers you've rejected: {rejection_count}
+- Call duration: {session.duration_minutes} minutes"""
+
+    # Add patience-based warnings
+    patience = persona.hidden.patience
+    if patience <= 0.15:
+        prompt += """
+
+## ⚠️ PATIENCE CRITICAL
+You are extremely impatient. You are almost certain to END_CALL unless this offer is exceptional."""
+    elif patience <= 0.30:
+        prompt += """
+
+## ⚠️ PATIENCE LOW
+You are getting frustrated. You are strongly considering ending this call."""
+
+    prompt += f"""
 
 ## The Offer Being Presented
 - Plan Type: {offer.plan_id.value}
@@ -323,7 +360,11 @@ class LLMBuyerSimulator:
         Raises:
             RuntimeError: If LLM call fails.
         """
-        prompt = create_buyer_prompt(persona, offer, session, seller_pitch, negotiation_history)
+        # Get rejection count from persona (may be tracked by environment)
+        rejection_count = getattr(persona, 'rejection_count', 0)
+        prompt = create_buyer_prompt(
+            persona, offer, session, seller_pitch, negotiation_history, rejection_count
+        )
 
         try:
             client = self._get_client()
@@ -347,8 +388,14 @@ class LLMBuyerSimulator:
             decision = BuyerDecision(result["decision"].lower())
             reason = result.get("reason", "")
             dialogue = result.get("dialogue", "")
+            request_dnc = result.get("request_dnc", False)
 
-            return BuyerResponseData(decision=decision, reason=reason, dialogue=dialogue)
+            return BuyerResponseData(
+                decision=decision,
+                reason=reason,
+                dialogue=dialogue,
+                request_dnc=request_dnc,
+            )
 
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Failed to parse LLM response as JSON: {e}")

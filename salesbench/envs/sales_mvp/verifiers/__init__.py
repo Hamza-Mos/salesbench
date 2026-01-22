@@ -3,23 +3,22 @@
 Prime Intellect Verifiers-compatible scoring and verification.
 
 Scoring:
-    from salesbench.envs.sales_mvp.verifiers import calculate_episode_score
-    score = calculate_episode_score(state)
+    from salesbench.envs.sales_mvp.verifiers import calculate_episode_revenue
+    metrics = calculate_episode_revenue(state)
+    score = metrics.total_revenue
 
 Server:
     python -m salesbench.envs.sales_mvp.verifiers.server --port 8000
 """
 
 from salesbench.envs.sales_mvp.verifiers.scoring import (
-    ScoreComponents,
-    ScoringRubric,
-    calculate_episode_score,
+    RevenueMetrics,
+    calculate_episode_revenue,
 )
 
 __all__ = [
-    "ScoringRubric",
-    "ScoreComponents",
-    "calculate_episode_score",
+    "RevenueMetrics",
+    "calculate_episode_revenue",
 ]
 
 

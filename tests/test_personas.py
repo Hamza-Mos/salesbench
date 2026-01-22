@@ -74,7 +74,6 @@ class TestPersonaGenerator:
             assert 0.0 <= hidden.trust <= 1.0, f"Trust {hidden.trust} out of bounds"
             assert 0.0 <= hidden.interest <= 1.0, f"Interest {hidden.interest} out of bounds"
             assert 0.0 <= hidden.patience <= 1.0, f"Patience {hidden.patience} out of bounds"
-            assert 0.0 <= hidden.dnc_risk <= 1.0, f"DNC risk {hidden.dnc_risk} out of bounds"
             assert (
                 0.01 <= hidden.close_threshold <= 0.15
             ), f"Close threshold {hidden.close_threshold} out of bounds"
@@ -153,7 +152,6 @@ class TestHiddenState:
             trust=0.5,
             interest=0.6,
             patience=0.7,
-            dnc_risk=0.1,
             close_threshold=0.05,
         )
 
@@ -162,5 +160,4 @@ class TestHiddenState:
         assert d["trust"] == 0.5
         assert d["interest"] == 0.6
         assert d["patience"] == 0.7
-        assert d["dnc_risk"] == 0.1
         assert d["close_threshold"] == 0.05

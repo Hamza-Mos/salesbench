@@ -53,7 +53,7 @@ class EpisodeRecord:
     started_at: datetime
     ended_at: Optional[datetime] = None
     num_leads: int = 100
-    total_days: int = 10
+    total_hours: int = 80
     final_score: Optional[float] = None
     metrics: Optional[dict] = None
     config: Optional[dict] = None
@@ -66,7 +66,7 @@ class EpisodeRecord:
             "started_at": self.started_at.isoformat(),
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
             "num_leads": self.num_leads,
-            "total_days": self.total_days,
+            "total_hours": self.total_hours,
             "final_score": self.final_score,
             "metrics": json.dumps(self.metrics) if self.metrics else None,
             "config": json.dumps(self.config) if self.config else None,

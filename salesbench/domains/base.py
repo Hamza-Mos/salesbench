@@ -16,7 +16,6 @@ class DomainConfig:
         product_types: List of product type identifiers
         persona_archetypes: List of buyer personality templates
         tools: List of available tool names
-        scoring_config: Domain-specific scoring parameters
     """
 
     name: str
@@ -25,7 +24,6 @@ class DomainConfig:
     product_types: list[str] = field(default_factory=list)
     persona_archetypes: list[dict[str, Any]] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
-    scoring_config: dict[str, Any] = field(default_factory=dict)
 
 
 class BaseDomain(ABC):
@@ -96,12 +94,3 @@ class BaseDomain(ABC):
         """
         pass
 
-    def get_scoring_config(self) -> dict[str, Any]:
-        """Return scoring configuration.
-
-        Override this to customize scoring for the domain.
-
-        Returns:
-            Dictionary with scoring parameters.
-        """
-        return self.config.scoring_config

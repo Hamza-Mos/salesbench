@@ -12,7 +12,12 @@ from typing import Any, Callable, Optional
 from salesbench.models import ModelSpec
 from salesbench.runner.config import BenchmarkConfig
 from salesbench.runner.integrations import IntegrationManager
-from salesbench.runner.results import EpisodeResult, TokenUsage, calculate_cost_breakdown
+from salesbench.runner.results import (
+    EpisodeProgress,
+    EpisodeResult,
+    TokenUsage,
+    calculate_cost_breakdown,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +68,7 @@ class EpisodeExecutor:
         seller_agent: Any,
         buyer_simulator: Callable,
         verbose_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Optional[Callable[[EpisodeProgress], None]] = None,
     ) -> EpisodeResult:
         """Run a single episode with full instrumentation.
 
@@ -72,6 +78,7 @@ class EpisodeExecutor:
             seller_agent: The seller agent to use.
             buyer_simulator: The buyer simulator function.
             verbose_callback: Optional callback for verbose output.
+            progress_callback: Optional callback for real-time progress updates.
 
         Returns:
             EpisodeResult with metrics and status.
@@ -111,10 +118,12 @@ class EpisodeExecutor:
             ) as episode_span:
                 # Run the actual episode
                 episode_result = self._run_episode_inner(
+                    episode_index=episode_index,
                     seed=seed,
                     seller_agent=seller_agent,
                     buyer_simulator=buyer_simulator,
                     verbose_callback=verbose_callback,
+                    progress_callback=progress_callback,
                 )
 
                 # Update result from orchestrator
@@ -168,34 +177,39 @@ class EpisodeExecutor:
 
     def _run_episode_inner(
         self,
+        episode_index: int,
         seed: int,
         seller_agent: Any,
         buyer_simulator: Callable,
         verbose_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Optional[Callable[[EpisodeProgress], None]] = None,
     ):
         """Run the core episode logic.
 
         Args:
+            episode_index: Zero-based episode index.
             seed: Random seed for this episode.
             seller_agent: The seller agent.
             buyer_simulator: The buyer simulator.
             verbose_callback: Optional verbose output callback.
+            progress_callback: Optional callback for real-time progress updates.
 
         Returns:
             EpisodeResult from orchestrator.
         """
-        from salesbench.core.config import SalesBenchConfig
+        from dataclasses import replace
+
         from salesbench.orchestrator.orchestrator import Orchestrator
 
-        # Create config and orchestrator
-        env_config = SalesBenchConfig(
-            seed=seed,
-            num_leads=self.config.num_leads,
-        )
+        # Clone episode config with new seed for this specific episode
+        # This preserves num_leads, budget, and other settings from the benchmark config
+        env_config = replace(self.config.episode_config, seed=seed)
+
         orchestrator = Orchestrator(
             config=env_config,
             seller_model_spec=self.seller_model_spec,
             buyer_model_spec=self.buyer_model_spec,
+            safety_max_turns=self.config.safety_max_turns,
         )
         orchestrator.set_buyer_simulator(buyer_simulator)
 
@@ -210,7 +224,11 @@ class EpisodeExecutor:
         tool_schemas = orchestrator.env.get_tools_schema()
 
         turn = 0
-        while not orchestrator.is_terminated and turn < self.config.max_turns:
+        # Loop until natural termination or safety limit (if configured)
+        while not orchestrator.is_terminated:
+            # Check safety limit if configured
+            if self.config.safety_max_turns and turn >= self.config.safety_max_turns:
+                break
             turn += 1
 
             # Convert dict to SellerObservation
@@ -275,6 +293,10 @@ class EpisodeExecutor:
                             lead_id=lead_id,
                             dialogue=buyer_conversation_response,
                         )
+                    # Record conversation turn for time tracking
+                    # Estimate tokens from the buyer response length (~4 chars per token)
+                    estimated_tokens = len(buyer_conversation_response) // 4
+                    orchestrator.record_conversation_turn(tokens=estimated_tokens)
 
             # Verbose output with clear [SELLER] and [BUYER] labels
             if verbose_callback and self.config.verbose:
@@ -289,8 +311,15 @@ class EpisodeExecutor:
                 # Tool results - check for buyer responses
                 if result:
                     for tr in result.tool_results:
-                        status = "OK" if tr.success else "FAIL"
                         data = tr.data or {}
+
+                        # Determine status: SKIP for graceful skips, OK/FAIL otherwise
+                        if data.get("skipped"):
+                            status = "SKIP"
+                        elif tr.success:
+                            status = "OK"
+                        else:
+                            status = "FAIL"
 
                         # Check if this contains a buyer response (from propose_plan, etc.)
                         if data.get("dialogue"):
@@ -300,6 +329,10 @@ class EpisodeExecutor:
                         elif data.get("decision"):
                             # Decision without dialogue
                             verbose_callback(f"  [BUYER][{data['decision'].upper()}]")
+                        elif data.get("skipped"):
+                            # Graceful skip - show reason
+                            reason = data.get("reason", "precondition not met")
+                            verbose_callback(f"  [TOOL][{status}] {reason}")
                         else:
                             # Regular tool result (full, no truncation)
                             verbose_callback(f"  [TOOL][{status}] {tr.data or tr.error}")
@@ -307,6 +340,16 @@ class EpisodeExecutor:
                 # Show buyer conversational response (if not already shown via decision)
                 if buyer_conversation_response:
                     verbose_callback(f"  [BUYER] {buyer_conversation_response}")
+
+            # Send progress update at configured interval (default every 5 turns)
+            interval = self.config.progress_interval
+            if progress_callback and (turn == 1 or turn % interval == 0):
+                progress = self._create_progress_update(
+                    episode_index=episode_index,
+                    turn=turn,
+                    orchestrator=orchestrator,
+                )
+                progress_callback(progress)
 
             if result and result.terminated:
                 break
@@ -342,19 +385,8 @@ class EpisodeExecutor:
         active_call = obs_dict.get("active_call") or {}
         stats = obs_dict.get("stats", {})
 
-        # Remaining minutes in the current business day (9:00–17:00).
-        # Default to a full day if we can't compute.
-        remaining_minutes = 8 * 60
-        try:
-            current_hour = int(time_info.get("current_hour", 9))
-            current_minute = int(time_info.get("current_minute", 0))
-            # Clamp into business hours to avoid negative values on boundary conditions.
-            current_hour = max(9, min(17, current_hour))
-            current_minute = max(0, min(59, current_minute))
-            minutes_elapsed = max(0, (current_hour - 9) * 60 + current_minute)
-            remaining_minutes = max(0, 8 * 60 - minutes_elapsed)
-        except Exception:
-            pass
+        # Get remaining minutes from the observation or compute from total budget
+        remaining_minutes = time_info.get("remaining_minutes", 4800)  # Default 80 hours
 
         # Convert tool results if present
         tool_results = []
@@ -371,10 +403,19 @@ class EpisodeExecutor:
             else:
                 tool_results.append(tr)
 
+        # Combine message and system_warning if both present
+        message = obs_dict.get("message")
+        system_warning = obs_dict.get("system_warning")
+        if system_warning:
+            if message:
+                message = f"{message}\n\n⚠️ {system_warning}"
+            else:
+                message = f"⚠️ {system_warning}"
+
         return SellerObservation(
-            current_day=time_info.get("current_day", 1),
-            current_hour=time_info.get("current_hour", 9),
-            remaining_minutes=time_info.get("remaining_minutes", remaining_minutes),
+            elapsed_hours=time_info.get("elapsed_hours", 0),
+            elapsed_minutes=time_info.get("elapsed_minutes", 0),
+            remaining_minutes=remaining_minutes,
             last_tool_results=tool_results,
             in_call=bool(obs_dict.get("has_active_call", False)),
             current_lead_id=(active_call.get("lead_id") if active_call else None),
@@ -384,7 +425,62 @@ class EpisodeExecutor:
             total_accepts=stats.get("accepted_offers", 0),
             total_rejects=stats.get("rejected_offers", 0),
             total_dnc_violations=stats.get("dnc_violations", 0),
-            message=obs_dict.get("message"),
+            message=message,
+        )
+
+    def _create_progress_update(
+        self,
+        episode_index: int,
+        turn: int,
+        orchestrator: Any,
+    ) -> EpisodeProgress:
+        """Create a progress update from current orchestrator state.
+
+        Args:
+            episode_index: Zero-based episode index.
+            turn: Current turn number.
+            orchestrator: The orchestrator instance.
+
+        Returns:
+            EpisodeProgress with current state.
+        """
+        from salesbench.core.types import LeadStatus
+
+        env_state = orchestrator.env.state
+        budget = orchestrator.config.budget
+
+        # Count leads by status
+        total_leads = len(env_state.leads)
+        leads_contacted = 0
+        leads_converted = 0
+        leads_dnc = 0
+        leads_active = 0
+
+        for lead in env_state.leads.values():
+            if lead.call_count > 0:
+                leads_contacted += 1
+            if lead.status == LeadStatus.CONVERTED:
+                leads_converted += 1
+            elif lead.status == LeadStatus.DNC:
+                leads_dnc += 1
+            elif lead.status == LeadStatus.ACTIVE:
+                leads_active += 1
+
+        return EpisodeProgress(
+            episode_index=episode_index,
+            turn=turn,
+            elapsed_hours=env_state.time.elapsed_hours,
+            elapsed_minutes=env_state.time.elapsed_minutes,
+            total_hours=budget.total_hours,
+            total_leads=total_leads,
+            leads_contacted=leads_contacted,
+            leads_converted=leads_converted,
+            leads_dnc=leads_dnc,
+            leads_active=leads_active,
+            in_call=env_state.active_call is not None,
+            current_lead_id=(
+                str(env_state.active_call.lead_id) if env_state.active_call else None
+            ),
         )
 
 

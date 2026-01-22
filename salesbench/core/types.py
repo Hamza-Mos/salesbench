@@ -26,6 +26,14 @@ def generate_appointment_id() -> AppointmentID:
     return AppointmentID(f"appt_{uuid.uuid4().hex[:8]}")
 
 
+class LeadStatus(str, Enum):
+    """Lead lifecycle status for natural termination tracking."""
+
+    ACTIVE = "active"  # Available to contact
+    CONVERTED = "converted"  # Accepted a plan
+    DNC = "dnc"  # Do not call (buyer requested)
+
+
 class BuyerDecision(str, Enum):
     """Buyer decision enum - the only outputs buyer can provide."""
 
@@ -204,6 +212,7 @@ class BuyerResponseData:
     decision: BuyerDecision
     reason: Optional[str] = None
     dialogue: Optional[str] = None  # What the buyer actually says
+    request_dnc: bool = False  # Buyer explicitly requests Do Not Call
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -212,6 +221,8 @@ class BuyerResponseData:
             result["reason"] = self.reason
         if self.dialogue:
             result["dialogue"] = self.dialogue
+        if self.request_dnc:
+            result["request_dnc"] = self.request_dnc
         return result
 
     @classmethod
@@ -221,6 +232,7 @@ class BuyerResponseData:
             decision=BuyerDecision(data["decision"]),
             reason=data.get("reason"),
             dialogue=data.get("dialogue"),
+            request_dnc=data.get("request_dnc", False),
         )
 
 

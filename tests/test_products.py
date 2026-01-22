@@ -231,6 +231,77 @@ class TestPricing:
         assert "benefit_period" in quote
         assert "waiting_period" in quote
 
+    def test_di_waiting_period_affects_premium(self, product_catalog: ProductCatalog):
+        """Test that shorter waiting periods increase DI premium."""
+        quote_90 = product_catalog.quote_premium(
+            plan_id=PlanType.DI,
+            age=35,
+            coverage_amount=5000,
+            risk_class=RiskClass.STANDARD_PLUS,
+            waiting_period_days=90,
+        )
+        quote_30 = product_catalog.quote_premium(
+            plan_id=PlanType.DI,
+            age=35,
+            coverage_amount=5000,
+            risk_class=RiskClass.STANDARD_PLUS,
+            waiting_period_days=30,
+        )
+        assert quote_30["monthly_premium"] > quote_90["monthly_premium"]
+        assert "30 days" in quote_30["waiting_period"]
+
+    def test_ltc_waiting_period_affects_premium(self, product_catalog: ProductCatalog):
+        """Test that shorter waiting periods increase LTC premium."""
+        quote_90 = product_catalog.quote_premium(
+            plan_id=PlanType.LTC,
+            age=55,
+            coverage_amount=150000,
+            risk_class=RiskClass.STANDARD,
+            waiting_period_days=90,
+        )
+        quote_30 = product_catalog.quote_premium(
+            plan_id=PlanType.LTC,
+            age=55,
+            coverage_amount=150000,
+            risk_class=RiskClass.STANDARD,
+            waiting_period_days=30,
+        )
+        assert quote_30["monthly_premium"] > quote_90["monthly_premium"]
+
+    def test_waiting_period_rejected_for_life_insurance(self, product_catalog: ProductCatalog):
+        """Test that waiting_period_days is rejected for non-DI/LTC plans."""
+        result = product_catalog.quote_premium(
+            plan_id=PlanType.TERM,
+            age=35,
+            coverage_amount=500000,
+            risk_class=RiskClass.STANDARD,
+            waiting_period_days=30,
+        )
+        assert "error" in result
+        assert "only applicable to DI and LTC" in result["error"]
+
+    def test_invalid_waiting_period_returns_error(self, product_catalog: ProductCatalog):
+        """Test that invalid waiting period returns error."""
+        result = product_catalog.quote_premium(
+            plan_id=PlanType.DI,
+            age=35,
+            coverage_amount=5000,
+            risk_class=RiskClass.STANDARD_PLUS,
+            waiting_period_days=45,  # Invalid
+        )
+        assert "error" in result
+        assert "Invalid waiting period" in result["error"]
+
+    def test_waiting_period_default_is_90_days(self, product_catalog: ProductCatalog):
+        """Test that default waiting period is 90 days."""
+        quote = product_catalog.quote_premium(
+            plan_id=PlanType.DI,
+            age=35,
+            coverage_amount=5000,
+            risk_class=RiskClass.STANDARD_PLUS,
+        )
+        assert quote["waiting_period"] == "90 days"
+
 
 class TestAgeBand:
     """Tests for age band calculation."""

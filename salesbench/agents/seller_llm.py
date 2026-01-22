@@ -10,8 +10,12 @@ Supports multiple LLM providers via the modular adapter:
 """
 
 import json
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+import logging
+from typing import TYPE_CHECKING, Optional
 
+logger = logging.getLogger(__name__)
+
+from salesbench.agents.providers import ToolCallingProvider, _to_api_name, get_provider
 from salesbench.agents.seller_base import (
     SellerAgent,
     SellerConfig,
@@ -24,7 +28,7 @@ from salesbench.llm import LLMClient, create_client, detect_available_provider
 if TYPE_CHECKING:
     from salesbench.context.episode import EpisodeContext
 
-SELLER_SYSTEM_PROMPT = """You are an AI insurance sales agent. Your goal is to sell insurance plans to leads.
+SELLER_SYSTEM_PROMPT = """You are Alex, an AI insurance sales agent. Your goal is to sell insurance plans to leads.
 
 ## HOW YOU COMMUNICATE
 
@@ -39,7 +43,7 @@ When in a call, your MESSAGE is what the buyer hears. Tool calls like `calling.p
 This benchmark expects **long, natural back-and-forth**. Behave like a professional agent:
 - Keep each spoken message **short (1–4 sentences)** and **conversational**.
 - Ask **one good question at a time** and **wait for the buyer's reply**.
-- If the buyer asks a question or raises an objection, **answer it directly first** (don’t jump to another offer).
+- If the buyer asks a question or raises an objection, **answer it directly first** (don't jump to another offer).
 - Do discovery early: confirm **goal**, **timeline**, **budget range**, **current coverage**, and **beneficiaries/dependents**.
 - Do not repeat the same pitch verbatim. Adapt to what the buyer just said.
 - Only present an offer after you have at least minimal qualification (unless the lead is clearly HOT).
@@ -49,12 +53,16 @@ This benchmark expects **long, natural back-and-forth**. Behave like a professio
 You are in one of these states:
 1. **NO_LEADS** → Search for leads with `crm.search_leads`
 2. **HAVE_LEADS** → Call a lead with `calling.start_call(lead_id="...")`
-3. **IN_CALL** → Send a message to pitch your offer, use `calling.propose_plan` to record it analytically
+3. **IN_CALL** → Pitch, handle objections, use `calling.propose_plan` to record offers
+4. **SALE_CLOSED** → Buyer accepted! Call `calling.end_call` immediately
 
 ### STATE TRANSITIONS:
-- NO_LEADS + search returns leads → HAVE_LEADS (next: start_call)
-- HAVE_LEADS + start_call → IN_CALL (next: message + propose_plan)
-- IN_CALL + call ends → HAVE_LEADS (call next lead) or NO_LEADS (search more)
+- NO_LEADS + search returns leads → HAVE_LEADS
+- HAVE_LEADS + start_call → IN_CALL
+- IN_CALL + buyer ACCEPTS → SALE_CLOSED (MUST call end_call)
+- IN_CALL + buyer rejects → IN_CALL (may present another offer)
+- IN_CALL + buyer hangs up or requests DNC → HAVE_LEADS or NO_LEADS
+- SALE_CLOSED + end_call → HAVE_LEADS or NO_LEADS
 
 ## ⚠️ CRITICAL RULES - READ CAREFULLY
 
@@ -62,11 +70,45 @@ You are in one of these states:
 2. **Use the lead_id from search results.** The "Next Action" section shows you exactly which lead_id to use.
 3. **If search returns 0 leads**, try a different temperature: hot → warm → lukewarm → cold.
 4. **When pitching a plan**, write your pitch in the MESSAGE and call `propose_plan` to record the offer details.
+5. **When buyer ACCEPTS**: The tool result will say "Buyer ACCEPTED the plan!" - your ONLY next action is `calling.end_call`. Do NOT propose again. Do NOT continue pitching. The sale is DONE.
+
+## ⚠️ STALL DETECTION - MANDATORY ACTION REQUIRED
+
+If you see a "STALL DETECTED" warning, you MUST take action immediately:
+- **Call `calling.end_call(reason='lead_not_ready')`** - This is NOT optional
+- Do NOT continue the conversation
+- Do NOT ask more questions
+- Do NOT repeat your pitch
+
+**Signs you should end the call EVEN WITHOUT a stall warning:**
+- Buyer keeps asking the same generic questions in a loop (e.g., "what do most people choose?")
+- Buyer deflects 3+ times without engaging with specifics
+- Buyer says "I'm not ready to decide" or similar multiple times
+- You've explained the same concept 2+ times already
+- Conversation is going in circles with no progress
+
+**CORRECT response to stall:**
+```
+MESSAGE: "I understand you need more time. I'll note your interest and you can reach out when ready."
++ calling.end_call(reason='lead_not_ready')
+```
+
+**WRONG response to stall:**
+```
+MESSAGE: "Let me explain one more time what most people choose..."  ← NEVER DO THIS
+```
+
+Time is limited. Move on to the next lead rather than spinning wheels.
 
 ## Available Tools
 
 ### CRM Tools
-- `crm.search_leads`: Search leads by temperature (hot/warm/lukewarm/cold), income, age
+- `crm.search_leads`: Search leads with filters:
+  - `temperature`: hot/warm/lukewarm/cold/hostile (try different temps to find more leads)
+  - `min_income`: Minimum annual income (e.g., 50000, 100000)
+  - `max_age`: Maximum age (e.g., 40, 55)
+  - `limit`: Max results (default 10)
+  TIP: Vary filters between searches to find different prospects.
 - `crm.get_lead`: Get lead details
 - `crm.update_lead`: Update notes
 - `crm.log_call`: Log call outcome
@@ -77,8 +119,6 @@ You are in one of these states:
 - `calling.end_call`: End current call
 
 **IMPORTANT**: `calling.propose_plan` does not include a `pitch` argument. The buyer hears ONLY your normal assistant message. Always write your pitch as your message text, then call `calling.propose_plan` to record the structured offer.
-
-**NOTE**: When a buyer ACCEPTS a plan, the call ends automatically. Do NOT call `end_call` after an acceptance - move directly to the next lead. Also, do NOT call a lead again after they've accepted - they're already a customer!
 
 ### Product Tools
 - `products.list_plans`: List available plans (TERM, WHOLE, UL, VUL, LTC, DI)
@@ -95,7 +135,7 @@ You are in one of these states:
 
 **next_step:** "close_now" (hot), "schedule_followup" (warm), "request_info" (cold)
 
-## Example - Correct Workflow
+## Example - Complete Sale Flow
 
 ```
 Turn 1: crm.search_leads(temperature="hot")
@@ -104,11 +144,31 @@ Turn 2: calling.start_call(lead_id="lead_abc123")
         → Call connected with John, age 35, $80k income, 2 dependents
 Turn 3: MESSAGE: "Hi John—quick question: do you already have coverage through work, and about how much?"
 Turn 4: MESSAGE: "Got it. And what monthly budget range feels comfortable if this protected your family?"
-Turn 5: MESSAGE: "Thanks. Based on that, here’s a simple option that fits…"
+Turn 5: MESSAGE: "Thanks. Based on that, here's a simple option that fits…"
         + calling.propose_plan(plan_id="TERM", monthly_premium=150, coverage_amount=500000, next_step="close_now")
-Turn 6: [Based on buyer response] MESSAGE: "I hear you on price—if we adjust coverage slightly, would that help?"
-        + another propose_plan or calling.end_call()
+        → Tool result: "Buyer ACCEPTED the plan! End the call with calling.end_call to finalize."
+Turn 6: MESSAGE: "Great, I'll get the paperwork started. Thanks John!"
+        + calling.end_call(reason="sale_completed")
+        → DONE. Move to next lead.
 ```
+
+**Handling rejections vs. acceptance:**
+- IF rejection: Try different angle/price + propose_plan (up to 3 attempts)
+- IF acceptance: Thank them + calling.end_call (REQUIRED - do NOT propose again)
+
+## ⚠️ CALL STATE AWARENESS
+
+Before using call-related tools, check your state:
+- **Can only use `calling.propose_plan`** when IN_CALL (after start_call, before end_call)
+- **Can only use `calling.end_call`** when IN_CALL
+- **After `calling.end_call`** succeeds, you are NO LONGER in a call
+
+The observation includes `in_call: true/false` - always check this before calling tools.
+
+Common mistakes to avoid:
+- ❌ Calling end_call after already ending the call
+- ❌ Calling propose_plan after end_call without starting a new call
+- ❌ Calling end_call multiple times in the same turn
 
 ## WRONG - Do Not Do This
 
@@ -124,28 +184,18 @@ Turn 3: calling.propose_plan(...) with NO MESSAGE ← WRONG! The buyer won't hea
 If you have leads, CALL THEM. When pitching, ALWAYS include a message."""
 
 
-def _to_api_name(tool_name: str) -> str:
-    """Convert tool name to OpenAI-compatible format (dots to double underscores)."""
-    return tool_name.replace(".", "__")
-
-
-def _from_api_name(api_name: str) -> str:
-    """Convert OpenAI API name back to tool name (double underscores to dots)."""
-    return api_name.replace("__", ".")
-
-
 def _postprocess_tool_calls(tool_calls: list[ToolCall]) -> list[ToolCall]:
-    """De-dupe tool calls and cap calling.propose_plan to one per action.
+    """De-dupe tool calls and cap certain calls to one per action.
 
     Some models/providers occasionally emit repeated identical tool calls in a single
     response. This breaks benchmark conversations by spamming tool execution errors.
     We keep the first occurrence (stable) and drop duplicates. Additionally, we allow
-    at most one `calling.propose_plan` per action, regardless of arguments.
+    at most one `calling.propose_plan` and one `calling.end_call` per action.
     """
-
     seen: set[tuple[str, str]] = set()
     filtered: list[ToolCall] = []
     propose_plan_seen = False
+    end_call_seen = False
 
     for tc in tool_calls:
         # Cap propose_plan to one per action (stable: keep first).
@@ -153,6 +203,12 @@ def _postprocess_tool_calls(tool_calls: list[ToolCall]) -> list[ToolCall]:
             if propose_plan_seen:
                 continue
             propose_plan_seen = True
+
+        # Cap end_call to one per action (stable: keep first).
+        if tc.tool_name == "calling.end_call":
+            if end_call_seen:
+                continue
+            end_call_seen = True
 
         # De-dupe exact repeats (stable: keep first).
         try:
@@ -173,6 +229,7 @@ def _has_propose_plan(tool_calls: list[ToolCall]) -> bool:
     return any(tc.tool_name == "calling.propose_plan" for tc in tool_calls)
 
 
+# Build tool schemas for LLM (OpenAI format)
 TOOLS_FOR_LLM = [
     {
         "type": "function",
@@ -225,10 +282,7 @@ class LLMSellerAgent(SellerAgent):
         self.model = model
         self._api_key = api_key
         self._client: Optional[LLMClient] = None
-        self._conversation_history: list[dict] = []
-        self._available_leads: list[dict] = []  # Synced from AnchoredState
-        self._called_lead_ids: set[str] = set()  # Synced from AnchoredState
-        self._accepted_lead_ids: set[str] = set()  # Synced from AnchoredState
+        self._provider_impl: Optional[ToolCallingProvider] = None
 
     def _get_client(self) -> LLMClient:
         """Get or create the LLM client."""
@@ -240,45 +294,24 @@ class LLMSellerAgent(SellerAgent):
             )
         return self._client
 
+    def _get_provider_impl(self) -> ToolCallingProvider:
+        """Get or create the provider implementation."""
+        if self._provider_impl is None:
+            client = self._get_client()
+            self._provider_impl = get_provider(
+                self.provider,
+                client,
+                self.model or self.config.model,
+                self._api_key,
+            )
+        return self._provider_impl
+
     def reset(self) -> None:
         """Reset agent state for new episode."""
         self._total_api_cost = 0.0
         self._turn_count = 0
         self._total_input_tokens = 0
         self._total_output_tokens = 0
-        self._conversation_history = []
-        self._available_leads = []
-        self._called_lead_ids = set()
-        self._accepted_lead_ids = set()
-
-    def _sync_from_anchored_state(self, episode_context: Optional["EpisodeContext"]) -> None:
-        """Sync agent state from AnchoredState (single source of truth).
-
-        The agent should READ from AnchoredState, not maintain parallel state.
-        This ensures the agent always has accurate information about:
-        - Which leads have been found
-        - Which leads have been called
-        - Which leads have accepted
-        """
-        if episode_context is None:
-            return
-
-        anchored = episode_context._anchored_state
-        self._called_lead_ids = set(anchored.called_lead_ids)
-        self._accepted_lead_ids = set(anchored.accepted_lead_ids)
-
-        # Rebuild available leads from AnchoredState (uncalled, non-accepted)
-        self._available_leads = [
-            {
-                "lead_id": lead.lead_id,
-                "name": lead.name,
-                "temperature": lead.temperature,
-                "annual_income": lead.income,
-            }
-            for lead in anchored.found_leads.values()
-            if lead.lead_id not in anchored.called_lead_ids
-            and lead.lead_id not in anchored.accepted_lead_ids
-        ]
 
     def act(
         self,
@@ -291,47 +324,29 @@ class LLMSellerAgent(SellerAgent):
         Args:
             observation: Current observation from environment.
             tools: Optional tool schemas (uses built-in if not provided).
-            episode_context: Optional episode context for conversation history.
-                            If provided, uses compressed episode history instead
-                            of internal sliding window.
+            episode_context: Episode context for conversation history (required).
 
         Returns:
             SellerAction containing message and/or tool calls.
+
+        Raises:
+            ValueError: If episode_context is not provided.
         """
-        # Sync agent state from AnchoredState (single source of truth)
-        self._sync_from_anchored_state(episode_context)
+        if episode_context is None:
+            raise ValueError("episode_context is required - benchmark always provides it")
 
         # Build user message from observation
-        user_message = self._build_user_message(observation)
-
-        # Add to conversation history (for fallback when no episode_context)
-        self._conversation_history.append(
-            {
-                "role": "user",
-                "content": user_message,
-            }
-        )
+        user_message = self._build_user_message(observation, episode_context)
 
         # Get LLM response (returns message and tool_calls)
         message, tool_calls = self._call_llm(user_message, episode_context)
 
-        # Add assistant response to history
-        assistant_content = message or ""
-        if tool_calls:
-            assistant_content += (
-                f"\n[Tool calls: {json.dumps([tc.to_dict() for tc in tool_calls])}]"
-            )
-        self._conversation_history.append(
-            {
-                "role": "assistant",
-                "content": assistant_content,
-            }
-        )
-
         self._turn_count += 1
         return SellerAction(tool_calls=tool_calls, message=message)
 
-    def _build_user_message(self, obs: SellerObservation) -> str:
+    def _build_user_message(
+        self, obs: SellerObservation, episode_context: "EpisodeContext"
+    ) -> str:
         """Build user message from observation.
 
         Shows facts only - no directive language. The model decides based on context.
@@ -340,34 +355,29 @@ class LLMSellerAgent(SellerAgent):
         """
         lines = [
             "## Current State",
-            f"- Day {obs.current_day}/10, Hour {obs.current_hour}:00",
-            f"- Remaining minutes today: {obs.remaining_minutes}",
+            f"- Time elapsed: {obs.elapsed_hours}h {obs.elapsed_minutes}m",
+            f"- Remaining minutes: {obs.remaining_minutes}",
             f"- Total calls made: {obs.total_calls}",
             f"- Accepts: {obs.total_accepts}, Rejects: {obs.total_rejects}",
             f"- DNC Violations: {obs.total_dnc_violations}",
         ]
 
         if obs.in_call:
-            lines.extend(
-                [
-                    "",
-                    f"## In Call: {obs.current_lead_id}",
-                    f"- Duration: {obs.call_duration} minutes",
-                    f"- Offers made this call: {obs.offers_this_call}",
-                ]
-            )
+            lines.extend([
+                "",
+                f"## In Call: {obs.current_lead_id}",
+                f"- Duration: {obs.call_duration} minutes",
+                f"- Offers made this call: {obs.offers_this_call}",
+            ])
 
         # Show tool results (just facts, no tracking updates - that's handled by AnchoredState)
         if obs.last_tool_results:
-            lines.extend(
-                [
-                    "",
-                    "## Last Tool Results",
-                ]
-            )
+            lines.extend([
+                "",
+                "## Last Tool Results",
+            ])
             for result in obs.last_tool_results:
                 if result.success:
-                    # Format the result data
                     data_str = json.dumps(result.data, default=str)
                     if len(data_str) > 1000:
                         data_str = data_str[:1000] + "..."
@@ -376,17 +386,15 @@ class LLMSellerAgent(SellerAgent):
                     lines.append(f"✗ {result.call_id}: {result.error}")
 
         if obs.message:
-            lines.extend(
-                [
-                    "",
-                    "## System Message",
-                    obs.message,
-                ]
-            )
+            lines.extend([
+                "",
+                "## System Message",
+                obs.message,
+            ])
 
-        # Current status section - just facts
+        # Current status section - get uncalled leads from AnchoredState (single source of truth)
         lines.append("")
-        uncalled_leads = self._available_leads  # Already filtered in _sync_from_anchored_state
+        uncalled_leads = episode_context._anchored_state.get_uncalled_leads()
         if obs.in_call:
             lines.append(
                 f"STATUS: In call with {obs.current_lead_id}, {obs.offers_this_call} offers made"
@@ -401,602 +409,64 @@ class LLMSellerAgent(SellerAgent):
     def _call_llm(
         self,
         user_message: str,
-        episode_context: Optional["EpisodeContext"] = None,
-    ) -> Tuple[Optional[str], list[ToolCall]]:
+        episode_context: "EpisodeContext",
+    ) -> tuple[Optional[str], list[ToolCall]]:
         """Call LLM API with function calling.
 
         Args:
             user_message: The current user message (observation).
-            episode_context: Optional episode context for conversation history.
+            episode_context: Episode context for conversation history (required).
 
         Returns:
             Tuple of (message, tool_calls) where message is optional free-form text
             and tool_calls is a list of tool calls.
         """
         client = self._get_client()
+        provider_impl = self._get_provider_impl()
 
         messages = [{"role": "system", "content": SELLER_SYSTEM_PROMPT}]
 
-        # Use episode context if provided, otherwise fall back to sliding window
-        if episode_context is not None:
-            # Get compressed episode history from context
-            context_messages = episode_context.get_seller_view()
-            messages.extend(context_messages)
-            # Add the current observation as the latest message
-            messages.append({"role": "user", "content": user_message})
-        else:
-            # Fallback: use internal sliding window (last 20 messages)
-            messages.extend(self._conversation_history[-20:])
+        # Trigger compaction if needed before getting seller view
+        episode_context.trigger_seller_compaction_sync()
 
-        # Use tool calling for OpenAI-compatible APIs
-        if self.provider in ["openai", "openrouter", "xai", "together"]:
-            return self._call_with_tools(client, messages)
-        elif self.provider == "anthropic":
-            return self._call_anthropic(client, messages)
-        else:
-            # Fallback to JSON-based tool calling
-            return self._call_with_json(client, messages)
+        # Get compressed episode history from context
+        context_messages = episode_context.get_seller_view()
+        messages.extend(context_messages)
+        # Add the current observation as the latest message
+        messages.append({"role": "user", "content": user_message})
 
-    def _call_with_tools(
-        self, client: LLMClient, messages: list
-    ) -> Tuple[Optional[str], list[ToolCall]]:
-        """Call using OpenAI-style tool calling.
-
-        Returns:
-            Tuple of (message, tool_calls).
-        """
-        # We need to use the raw OpenAI client for tool calling
-        import openai
-
-        if hasattr(client, "_client") and isinstance(client._client, openai.OpenAI):
-            raw_client = client._client
-        else:
-            raw_client = openai.OpenAI(
-                api_key=self._api_key,
-                base_url=getattr(client, "_base_url", None),
-            )
-
-        model_name = client.get_model_name()
-
-        # Newer models (gpt-5.x, o1, o3, etc.) use max_completion_tokens
-        uses_new_api = any(x in model_name for x in ["gpt-5", "gpt-4.1", "o1", "o3"])
-
-        api_params = {
-            "model": model_name,
-            "messages": messages,
-            "temperature": self.config.temperature,
-            "tools": TOOLS_FOR_LLM,
-            "tool_choice": "auto",  # Let model output text and/or tools
-        }
-
-        if uses_new_api:
-            api_params["max_completion_tokens"] = self.config.max_tokens
-        else:
-            api_params["max_tokens"] = self.config.max_tokens
-
-        response = raw_client.chat.completions.create(**api_params)
-
-        # Track cost
-        if response.usage:
-            self._track_cost(
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
-                client.get_model_name(),
-            )
-
-        # Parse message and tool calls from response
-        tool_calls = []
-        response_message = response.choices[0].message
-
-        # Get the text content (message to buyer)
-        text_content = response_message.content
-
-        if response_message.tool_calls:
-            for tc in response_message.tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments)
-                    tool_calls.append(
-                        ToolCall(
-                            tool_name=_from_api_name(tc.function.name),
-                            arguments=args,
-                            call_id=tc.id,
-                        )
-                    )
-                except json.JSONDecodeError:
-                    continue
-
-        # If no output at all, use fallback
-        if not tool_calls and not text_content:
-            return None, self._fallback_action()
-
-        # Post-process tool calls
-        filtered_tool_calls = _postprocess_tool_calls(tool_calls)
-
-        # GUARDRAIL: If propose_plan without message, re-prompt once
-        if _has_propose_plan(filtered_tool_calls) and not (text_content and text_content.strip()):
-            text_content = self._reprompt_for_message(client, messages, filtered_tool_calls)
-
-        return text_content, filtered_tool_calls
-
-    def _call_anthropic(
-        self, client: LLMClient, messages: list
-    ) -> Tuple[Optional[str], list[ToolCall]]:
-        """Call Anthropic API with tool use.
-
-        Returns:
-            Tuple of (message, tool_calls).
-        """
-        import anthropic
-
-        if hasattr(client, "_client") and isinstance(client._client, anthropic.Anthropic):
-            raw_client = client._client
-        else:
-            raw_client = anthropic.Anthropic(api_key=self._api_key)
-
-        # Convert tools to Anthropic format (Anthropic accepts dots in names)
-        anthropic_tools = [
-            {
-                "name": _to_api_name(tool),
-                "description": f"Call the {tool} tool",
-                "input_schema": schema,
-            }
-            for tool, schema in get_all_tool_schemas().items()
-        ]
-
-        # Filter out system message
-        chat_messages = [m for m in messages if m["role"] != "system"]
-
-        response = raw_client.messages.create(
-            model=client.get_model_name(),
-            max_tokens=self.config.max_tokens,
-            system=SELLER_SYSTEM_PROMPT,
-            messages=chat_messages,
-            tools=anthropic_tools,
-        )
-
-        # Track cost
-        self._track_cost(
-            response.usage.input_tokens,
-            response.usage.output_tokens,
-            client.get_model_name(),
-        )
-
-        # Parse text content and tool calls
-        tool_calls = []
-        text_content = None
-
-        for content in response.content:
-            if content.type == "text":
-                text_content = content.text
-            elif content.type == "tool_use":
-                tool_calls.append(
-                    ToolCall(
-                        tool_name=_from_api_name(content.name),
-                        arguments=content.input,
-                        call_id=content.id,
-                    )
-                )
-
-        # If no output at all, use fallback
-        if not tool_calls and not text_content:
-            return None, self._fallback_action()
-
-        # Post-process tool calls
-        filtered_tool_calls = _postprocess_tool_calls(tool_calls)
-
-        # GUARDRAIL: If propose_plan without message, re-prompt once
-        if _has_propose_plan(filtered_tool_calls) and not (text_content and text_content.strip()):
-            text_content = self._reprompt_for_message_anthropic(
-                client, messages, filtered_tool_calls
-            )
-
-        return text_content, filtered_tool_calls
-
-    def _call_with_json(
-        self, client: LLMClient, messages: list
-    ) -> Tuple[Optional[str], list[ToolCall]]:
-        """Call using JSON-based tool calling (for providers without native tool support).
-
-        Returns:
-            Tuple of (message, tool_calls).
-        """
-        response = client.complete(
+        # Use provider abstraction for the call
+        text_content, tool_calls, in_tokens, out_tokens = provider_impl.call_with_tools(
             messages=messages,
+            tools=TOOLS_FOR_LLM,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
-            response_format={"type": "json_object"},
-        )
-
-        try:
-            content = json.loads(response.content)
-            message = content.get("message")
-            raw_calls = content.get("tool_calls", [])
-
-            tool_calls = []
-            for tc_data in raw_calls:
-                if isinstance(tc_data, dict):
-                    tool_calls.append(
-                        ToolCall(
-                            tool_name=tc_data.get("tool_name", ""),
-                            arguments=tc_data.get("arguments", {}),
-                        )
-                    )
-
-            if tool_calls or message:
-                return message, _postprocess_tool_calls(tool_calls)
-        except (json.JSONDecodeError, KeyError):
-            pass
-
-        return None, self._fallback_action()
-
-    def _reprompt_for_message(
-        self,
-        client: LLMClient,
-        messages: list,
-        tool_calls: list[ToolCall],
-    ) -> Optional[str]:
-        """Re-prompt LLM to provide spoken message for propose_plan.
-
-        When the model calls propose_plan without any text content, we make
-        a second call (no tools) asking for just the spoken pitch.
-
-        Args:
-            client: The LLM client.
-            messages: Original conversation messages.
-            tool_calls: The tool calls that were made (includes propose_plan).
-
-        Returns:
-            The spoken message text, or None if still missing.
-        """
-        import openai
-
-        # Extract propose_plan details for context
-        propose_call = next(
-            (tc for tc in tool_calls if tc.tool_name == "calling.propose_plan"), None
-        )
-        if not propose_call:
-            return None
-
-        args = propose_call.arguments or {}
-        plan_id = args.get("plan_id", "insurance plan")
-        premium = args.get("monthly_premium", "")
-        coverage = args.get("coverage_amount", "")
-
-        # Build a focused re-prompt
-        reprompt_message = (
-            f"You just called propose_plan for {plan_id} "
-            f"(${premium}/month, ${coverage} coverage) but you didn't include "
-            "any spoken message to the buyer. The buyer cannot see tool calls - "
-            "they only hear what you say.\n\n"
-            "Please provide ONLY your spoken pitch (1-3 sentences) that presents "
-            "this offer to the buyer. Do not include any tool calls or explanations."
-        )
-
-        # Make a second call without tools
-        reprompt_messages = messages + [{"role": "user", "content": reprompt_message}]
-
-        if hasattr(client, "_client") and isinstance(client._client, openai.OpenAI):
-            raw_client = client._client
-        else:
-            raw_client = openai.OpenAI(
-                api_key=self._api_key,
-                base_url=getattr(client, "_base_url", None),
-            )
-
-        model_name = client.get_model_name()
-        uses_new_api = any(x in model_name for x in ["gpt-5", "gpt-4.1", "o1", "o3"])
-
-        api_params = {
-            "model": model_name,
-            "messages": reprompt_messages,
-            "temperature": self.config.temperature,
-        }
-
-        if uses_new_api:
-            api_params["max_completion_tokens"] = 256
-        else:
-            api_params["max_tokens"] = 256
-
-        response = raw_client.chat.completions.create(**api_params)
-
-        # Track cost
-        if response.usage:
-            self._track_cost(
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
-                client.get_model_name(),
-            )
-
-        text_content = response.choices[0].message.content
-        if text_content and text_content.strip():
-            return text_content.strip()
-        return None
-
-    def _reprompt_for_message_anthropic(
-        self,
-        client: LLMClient,
-        messages: list,
-        tool_calls: list[ToolCall],
-    ) -> Optional[str]:
-        """Re-prompt Anthropic LLM to provide spoken message for propose_plan.
-
-        Args:
-            client: The Anthropic client.
-            messages: Original conversation messages.
-            tool_calls: The tool calls that were made (includes propose_plan).
-
-        Returns:
-            The spoken message text, or None if still missing.
-        """
-        import anthropic
-
-        # Extract propose_plan details for context
-        propose_call = next(
-            (tc for tc in tool_calls if tc.tool_name == "calling.propose_plan"), None
-        )
-        if not propose_call:
-            return None
-
-        args = propose_call.arguments or {}
-        plan_id = args.get("plan_id", "insurance plan")
-        premium = args.get("monthly_premium", "")
-        coverage = args.get("coverage_amount", "")
-
-        reprompt_message = (
-            f"You just called propose_plan for {plan_id} "
-            f"(${premium}/month, ${coverage} coverage) but you didn't include "
-            "any spoken message to the buyer. The buyer cannot see tool calls - "
-            "they only hear what you say.\n\n"
-            "Please provide ONLY your spoken pitch (1-3 sentences) that presents "
-            "this offer to the buyer. Do not include any tool calls or explanations."
-        )
-
-        if hasattr(client, "_client") and isinstance(client._client, anthropic.Anthropic):
-            raw_client = client._client
-        else:
-            raw_client = anthropic.Anthropic(api_key=self._api_key)
-
-        # Filter out system message and add reprompt
-        chat_messages = [m for m in messages if m["role"] != "system"]
-        chat_messages.append({"role": "user", "content": reprompt_message})
-
-        response = raw_client.messages.create(
-            model=client.get_model_name(),
-            max_tokens=256,
-            system=SELLER_SYSTEM_PROMPT,
-            messages=chat_messages,
         )
 
         # Track cost
-        self._track_cost(
-            response.usage.input_tokens,
-            response.usage.output_tokens,
-            client.get_model_name(),
-        )
+        self._track_cost(in_tokens, out_tokens, client.get_model_name())
 
-        # Extract text content
-        for content in response.content:
-            if content.type == "text" and content.text and content.text.strip():
-                return content.text.strip()
-        return None
+        # If no output at all, use fallback
+        if not tool_calls and not text_content:
+            return None, self._fallback_action()
+
+        # Post-process tool calls
+        filtered_tool_calls = _postprocess_tool_calls(tool_calls)
+
+        # GUARDRAIL: If propose_plan without message, re-prompt once
+        if _has_propose_plan(filtered_tool_calls) and not (text_content and text_content.strip()):
+            reprompt_text, reprompt_in, reprompt_out = provider_impl.reprompt_for_message(
+                messages,
+                filtered_tool_calls,
+                SELLER_SYSTEM_PROMPT,
+                self.config.temperature,
+            )
+            self._track_cost(reprompt_in, reprompt_out, client.get_model_name())
+            if reprompt_text:
+                text_content = reprompt_text
+
+        return text_content, filtered_tool_calls
 
     def _fallback_action(self) -> list[ToolCall]:
         """Raise error when LLM returns nothing - no silent fallbacks."""
         raise RuntimeError("LLM returned no output (no message and no tool calls)")
-
-
-class StreamingLLMSellerAgent(LLMSellerAgent):
-    """LLM seller with streaming support for real-time feedback."""
-
-    def __init__(
-        self,
-        config: Optional[SellerConfig] = None,
-        provider: Optional[str] = None,
-        model: Optional[str] = None,
-        api_key: Optional[str] = None,
-        on_token: Optional[callable] = None,
-    ):
-        """Initialize streaming LLM seller.
-
-        Args:
-            config: Agent configuration.
-            provider: LLM provider.
-            model: Model name.
-            api_key: API key.
-            on_token: Callback for each streamed token.
-        """
-        super().__init__(config, provider, model, api_key)
-        self.on_token = on_token or (lambda x: None)
-
-    def _call_with_tools(
-        self, client: LLMClient, messages: list
-    ) -> Tuple[Optional[str], list[ToolCall]]:
-        """Call with streaming for OpenAI-compatible APIs.
-
-        Returns:
-            Tuple of (message, tool_calls).
-        """
-        import openai
-
-        if hasattr(client, "_client") and isinstance(client._client, openai.OpenAI):
-            raw_client = client._client
-        else:
-            raw_client = openai.OpenAI(api_key=self._api_key)
-
-        model_name = client.get_model_name()
-
-        # Newer models (gpt-5.x, o1, o3, etc.) use max_completion_tokens
-        uses_new_api = any(x in model_name for x in ["gpt-5", "gpt-4.1", "o1", "o3"])
-
-        api_params = {
-            "model": model_name,
-            "messages": messages,
-            "temperature": self.config.temperature,
-            "tools": TOOLS_FOR_LLM,
-            "tool_choice": "auto",  # Let model output text and/or tools
-            "stream": True,
-        }
-
-        if uses_new_api:
-            api_params["max_completion_tokens"] = self.config.max_tokens
-        else:
-            api_params["max_tokens"] = self.config.max_tokens
-
-        stream = raw_client.chat.completions.create(**api_params)
-
-        # Collect streamed content
-        tool_calls_data = {}
-        text_content = ""
-
-        for chunk in stream:
-            delta = chunk.choices[0].delta
-
-            # Collect text content
-            if delta.content:
-                text_content += delta.content
-                self.on_token(delta.content)
-
-            # Collect tool calls
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    if tc.index not in tool_calls_data:
-                        tool_calls_data[tc.index] = {
-                            "id": tc.id or "",
-                            "name": "",
-                            "arguments": "",
-                        }
-                    if tc.function:
-                        if tc.function.name:
-                            tool_calls_data[tc.index]["name"] += tc.function.name
-                        if tc.function.arguments:
-                            tool_calls_data[tc.index]["arguments"] += tc.function.arguments
-
-        # Parse collected tool calls
-        tool_calls = []
-        for _, data in sorted(tool_calls_data.items()):
-            try:
-                args = json.loads(data["arguments"])
-                tool_calls.append(
-                    ToolCall(
-                        tool_name=_from_api_name(data["name"]),
-                        arguments=args,
-                        call_id=data["id"],
-                    )
-                )
-            except json.JSONDecodeError:
-                continue
-
-        # If no output at all, use fallback
-        if not tool_calls and not text_content:
-            return None, self._fallback_action()
-
-        # Post-process tool calls
-        filtered_tool_calls = _postprocess_tool_calls(tool_calls)
-
-        # GUARDRAIL: If propose_plan without message, re-prompt once
-        if _has_propose_plan(filtered_tool_calls) and not (text_content and text_content.strip()):
-            text_content = self._reprompt_for_message(client, messages, filtered_tool_calls)
-
-        return text_content or None, filtered_tool_calls
-
-
-class ReActSellerAgent(LLMSellerAgent):
-    """ReAct-style seller agent with explicit reasoning.
-
-    Uses a Reason-Act loop where the agent explicitly reasons
-    before each action.
-    """
-
-    def _build_user_message(self, obs: SellerObservation) -> str:
-        """Build ReAct-style user message."""
-        base_message = super()._build_user_message(obs)
-
-        react_prompt = """
-## ReAct Instructions
-
-Before deciding on your response, explicitly reason about:
-1. **Observation**: What do you observe from the current state?
-2. **Thought**: What strategy should you use? Why?
-3. **Action**: What message will you send and/or what tools will you call?
-
-Format your response as:
-{
-    "observation": "What I see...",
-    "thought": "My reasoning...",
-    "action": {
-        "message": "Your message to the buyer (if in a call)",
-        "tool_calls": [...]
-    }
-}
-"""
-        return base_message + react_prompt
-
-    def _call_llm(
-        self,
-        user_message: str,
-        episode_context: Optional["EpisodeContext"] = None,
-    ) -> Tuple[Optional[str], list[ToolCall]]:
-        """Call LLM with ReAct-style prompting.
-
-        Args:
-            user_message: The current user message (observation).
-            episode_context: Optional episode context for conversation history.
-
-        Returns:
-            Tuple of (message, tool_calls).
-        """
-        client = self._get_client()
-
-        messages = [{"role": "system", "content": SELLER_SYSTEM_PROMPT}]
-
-        # Use episode context if provided, otherwise fall back to sliding window
-        if episode_context is not None:
-            context_messages = episode_context.get_seller_view()
-            messages.extend(context_messages)
-            messages.append({"role": "user", "content": user_message})
-        else:
-            messages.extend(self._conversation_history[-20:])
-
-        response = client.complete(
-            messages=messages,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-            response_format={"type": "json_object"},
-        )
-
-        try:
-            content = json.loads(response.content)
-            # Store reasoning for debugging
-            self._last_reasoning = {
-                "observation": content.get("observation", ""),
-                "thought": content.get("thought", ""),
-            }
-
-            # Extract message and tool calls
-            action = content.get("action", content)
-            message = action.get("message")
-            raw_calls = action.get("tool_calls", [])
-
-            tool_calls = []
-            for tc_data in raw_calls:
-                if isinstance(tc_data, dict):
-                    tool_calls.append(
-                        ToolCall(
-                            tool_name=tc_data.get("tool_name", ""),
-                            arguments=tc_data.get("arguments", {}),
-                        )
-                    )
-
-            if tool_calls or message:
-                return message, _postprocess_tool_calls(tool_calls)
-        except (json.JSONDecodeError, KeyError):
-            pass
-
-        return None, self._fallback_action()
-
-    def get_stats(self) -> dict[str, Any]:
-        """Include last reasoning in stats."""
-        stats = super().get_stats()
-        if hasattr(self, "_last_reasoning"):
-            stats["last_reasoning"] = self._last_reasoning
-        return stats

@@ -4,7 +4,6 @@ Aggregators process event streams to compute:
 - Episode-level metrics
 - Call-level metrics
 - Performance statistics
-- pass^k metrics
 """
 
 from abc import ABC, abstractmethod
@@ -308,68 +307,14 @@ class PerformanceAggregator(EventAggregator):
             "min_revenue": min(revenues),
             # Acceptance rates
             "mean_acceptance_rate": sum(acceptance_rates) / n,
-            # pass^k metrics
-            "pass_at_1": self._pass_at_k(1),
-            "pass_at_3": self._pass_at_k(3),
-            "pass_at_5": self._pass_at_k(5),
-            "pass_at_10": self._pass_at_k(10),
+            # Episode success rate (at least 1 conversion)
+            "episode_success_rate": sum(1 for r in self.episode_results if r.get("total_accepts", 0) > 0) / n,
             # Distribution of results
             "episode_results": self.episode_results,
         }
-
-    def _pass_at_k(self, k: int, threshold: float = 0.0) -> float:
-        """Compute pass@k metric.
-
-        pass@k = probability that at least one of k samples achieves threshold.
-
-        Args:
-            k: Number of samples.
-            threshold: Minimum acceptance rate to consider "passing".
-
-        Returns:
-            pass@k probability.
-        """
-        if not self.episode_results:
-            return 0.0
-
-        n = len(self.episode_results)
-        if k > n:
-            k = n
-
-        # Count passing samples
-        passing = sum(1 for r in self.episode_results if r.get("acceptance_rate", 0) > threshold)
-
-        # Compute pass@k using combinatorial formula
-        if passing == 0:
-            return 0.0
-        if passing >= k:
-            return 1.0
-
-        # P(at least one success in k) = 1 - P(no success in k)
-        # = 1 - C(n-passing, k) / C(n, k)
-        from math import comb
-
-        prob_no_success = comb(n - passing, k) / comb(n, k) if n >= k else 0
-        return 1.0 - prob_no_success
 
     def reset(self) -> None:
         """Reset all state."""
         self.episode_results.clear()
         self._current_episode_id = None
         self._current_aggregator = None
-
-    def compute_pass_at_k(
-        self,
-        k_values: list[int],
-        threshold: float = 0.0,
-    ) -> dict[str, float]:
-        """Compute pass@k for multiple k values.
-
-        Args:
-            k_values: List of k values.
-            threshold: Minimum rate to consider passing.
-
-        Returns:
-            Dict mapping k to pass@k values.
-        """
-        return {f"pass@{k}": self._pass_at_k(k, threshold) for k in k_values}

@@ -120,14 +120,13 @@ class TestEpisodeFlow:
 class TestTerminationConditions:
     """Tests for episode termination conditions."""
 
-    def test_budget_exhaustion_terminates(self, mock_buyer_simulator):
-        """Test that budget exhaustion terminates episode."""
+    def test_time_limit_terminates(self, mock_buyer_simulator):
+        """Test that time limit terminates episode."""
         config = SalesBenchConfig(
             seed=42,
             num_leads=10,
             budget=BudgetConfig(
-                total_days=1,
-                max_calls_per_day=2,
+                total_hours=1,  # Just 1 hour - episode ends when time passes
             ),
         )
         env = SalesEnv(config=config)
@@ -287,8 +286,8 @@ class TestVerifiersEnvironment:
 
         env = load_environment(seed=42, num_leads=10, num_episodes=5)
 
-        # Check tools are registered
-        assert len(env.tools) == 12  # 12 tools defined in TOOL_FUNCTIONS
+        # Check tools are registered (12 tools)
+        assert len(env.tools) == 12
 
     def test_tool_env_has_rubric(self):
         """Test that SalesBenchToolEnv has a rubric."""

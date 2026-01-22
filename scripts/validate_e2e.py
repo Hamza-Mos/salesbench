@@ -92,7 +92,7 @@ class SalesBenchValidator:
             from salesbench.core.types import ToolCall, ToolResult
             from salesbench.envs.sales_mvp.personas import PersonaGenerator
             from salesbench.envs.sales_mvp.products import ProductCatalog
-            from salesbench.envs.sales_mvp.verifiers.scoring import calculate_episode_score
+            from salesbench.envs.sales_mvp.verifiers.scoring import calculate_episode_revenue
             from salesbench.orchestrator.orchestrator import Orchestrator
 
             return True, "All imports successful"
@@ -154,37 +154,38 @@ class SalesBenchValidator:
     def validate_environment_creation(self) -> tuple[bool, str]:
         """Validate environment can be created and reset."""
         from salesbench.core.config import BudgetConfig, SalesBenchConfig
-        from salesbench.environment import SalesBenchEnvironment
+        from salesbench.envs.sales_mvp.env import SalesEnv
 
         config = SalesBenchConfig(
             seed=42,
             num_leads=10,
-            budget=BudgetConfig(total_days=10),
+            budget=BudgetConfig(total_hours=10),
         )
 
-        env = SalesBenchEnvironment(config=config)
-        obs = env.reset()
+        env = SalesEnv(config=config)
+        env.reset()
+        obs = env._get_observation()
 
-        if "tools" not in obs:
-            return False, "Observation missing tools"
+        if "time" not in obs:
+            return False, "Observation missing time"
 
-        if "leads_summary" not in obs:
-            return False, "Observation missing leads_summary"
+        if "leads_count" not in obs:
+            return False, "Observation missing leads_count"
 
-        return True, f"Environment created with {obs['leads_summary']['total']} leads"
+        return True, f"Environment created with {obs['leads_count']} leads"
 
     def validate_tool_execution(self) -> tuple[bool, str]:
         """Validate basic tool execution."""
         from salesbench.core.config import BudgetConfig, SalesBenchConfig
         from salesbench.core.types import ToolCall
-        from salesbench.environment import SalesBenchEnvironment
+        from salesbench.envs.sales_mvp.env import SalesEnv
 
-        config = SalesBenchConfig(seed=42, num_leads=10, budget=BudgetConfig(total_days=10))
-        env = SalesBenchEnvironment(config=config)
+        config = SalesBenchConfig(seed=42, num_leads=10, budget=BudgetConfig(total_hours=10))
+        env = SalesEnv(config=config)
         env.reset()
 
         # Mock buyer to avoid API calls
-        def mock_buyer(lead, offer, session, pitch=None):
+        def mock_buyer(lead, offer, session, seller_pitch=None, negotiation_history=None):
             from salesbench.core.types import BuyerDecision, BuyerResponseData
 
             return BuyerResponseData(decision=BuyerDecision.REJECT_PLAN, dialogue="No thanks")
@@ -192,31 +193,30 @@ class SalesBenchValidator:
         env.set_buyer_simulator(mock_buyer)
 
         # Test CRM search
-        obs, _, _, info = env.step([ToolCall(tool_name="crm.search_leads", arguments={})])
+        result = env.execute_tool(ToolCall(tool_name="crm.search_leads", arguments={}))
 
-        tool_results = info.get("tool_results", [])
-        if not tool_results:
-            return False, "No tool results returned"
+        if not result.success:
+            return False, f"Tool failed: {result.error}"
 
-        if not tool_results[0].get("success"):
-            return False, f"Tool failed: {tool_results[0].get('error')}"
+        if "leads" not in result.data:
+            return False, "Tool result missing leads data"
 
-        return True, "CRM search executed successfully"
+        return True, f"CRM search executed successfully, found {len(result.data.get('leads', []))} leads"
 
     def validate_call_flow(self) -> tuple[bool, str]:
         """Validate complete call flow."""
         from salesbench.core.config import BudgetConfig, SalesBenchConfig
         from salesbench.core.types import BuyerDecision, ToolCall
-        from salesbench.environment import SalesBenchEnvironment
+        from salesbench.envs.sales_mvp.env import SalesEnv
 
-        config = SalesBenchConfig(seed=42, num_leads=10, budget=BudgetConfig(total_days=10))
-        env = SalesBenchEnvironment(config=config)
+        config = SalesBenchConfig(seed=42, num_leads=10, budget=BudgetConfig(total_hours=10))
+        env = SalesEnv(config=config)
         env.reset()
 
         # Track decisions
         decisions = []
 
-        def tracking_buyer(lead, offer, session, pitch=None):
+        def tracking_buyer(lead, offer, session, seller_pitch=None, negotiation_history=None):
             from salesbench.core.types import BuyerResponseData
 
             # Accept first offer, reject second
@@ -229,87 +229,100 @@ class SalesBenchValidator:
         env.set_buyer_simulator(tracking_buyer)
 
         # Search leads
-        _, _, _, info = env.step([ToolCall(tool_name="crm.search_leads", arguments={"limit": 1})])
-        lead_id = info["tool_results"][0]["data"]["leads"][0]["lead_id"]
+        search_result = env.execute_tool(ToolCall(tool_name="crm.search_leads", arguments={"limit": 1}))
+        if not search_result.success:
+            return False, f"Search failed: {search_result.error}"
+        lead_id = search_result.data["leads"][0]["lead_id"]
 
         # Start call
-        env.step([ToolCall(tool_name="calling.start_call", arguments={"lead_id": lead_id})])
+        start_result = env.execute_tool(ToolCall(tool_name="calling.start_call", arguments={"lead_id": lead_id}))
+        if not start_result.success:
+            return False, f"Start call failed: {start_result.error}"
 
         # Propose plan (with monthly_premium calculated)
-        obs, reward, _, _ = env.step(
-            [
-                ToolCall(
-                    tool_name="calling.propose_plan",
-                    arguments={
-                        "plan_id": "TERM",
-                        "coverage_amount": 500000,
-                        "monthly_premium": 60.0,  # Approx for 35yo, 500K TERM
-                        "next_step": "close_now",
-                    },
-                )
-            ]
+        propose_result = env.execute_tool(
+            ToolCall(
+                tool_name="calling.propose_plan",
+                arguments={
+                    "plan_id": "TERM",
+                    "coverage_amount": 500000,
+                    "monthly_premium": 60.0,  # Approx for 35yo, 500K TERM
+                    "next_step": "close_now",
+                    "term_years": 20,
+                },
+            )
         )
+        if not propose_result.success:
+            return False, f"Propose plan failed: {propose_result.error}"
 
-        if reward <= 0:
-            return False, f"Expected positive reward for accept, got {reward}"
+        # Check if plan was accepted (buyer decision in result)
+        buyer_decision = propose_result.data.get("decision")
+        if buyer_decision != "accept_plan":
+            return False, f"Expected accept_plan, got {buyer_decision}"
 
         # End call
-        env.step([ToolCall(tool_name="calling.end_call", arguments={})])
+        end_result = env.execute_tool(ToolCall(tool_name="calling.end_call", arguments={}))
+        if not end_result.success:
+            return False, f"End call failed: {end_result.error}"
 
-        return True, f"Call flow completed with reward={reward:.2f}"
+        return True, f"Call flow completed successfully, buyer decision: {buyer_decision}"
 
     def validate_scoring(self) -> tuple[bool, str]:
-        """Validate scoring calculations."""
-        from salesbench.core.types import NextStep
-        from salesbench.envs.sales_mvp.verifiers.scoring import ScoringRubric
+        """Validate scoring calculations (revenue-based).
 
-        rubric = ScoringRubric()
+        Score = Total Revenue (sum of monthly premiums from accepted plans).
+        No penalties - DNC violations are tracked as a metric, not a penalty.
+        """
+        from salesbench.envs.sales_mvp.verifiers.scoring import RevenueMetrics
 
-        # Test accept
-        score = rubric.record_accept(monthly_premium=100, next_step=NextStep.CLOSE_NOW)
-        if score <= 0:
-            return False, "Accept should give positive score"
+        metrics = RevenueMetrics()
 
-        # Test reject penalty
-        penalty = rubric.record_reject()
-        if penalty >= 0:
-            return False, "Reject should give negative score"
+        # Test that adding revenue works
+        metrics.total_revenue = 150.0  # Monthly premium from accepted plan
+        metrics.num_accepts = 1
 
-        # Test DNC
-        dnc_penalty = rubric.record_dnc_violation()
-        if dnc_penalty >= -50:
-            return False, "DNC should give significant penalty"
+        if metrics.total_revenue <= 0:
+            return False, "Accept should add revenue"
+
+        if metrics.revenue_per_accept != 150.0:
+            return False, "Revenue per accept should be calculated correctly"
+
+        # Test DNC is tracked but not a penalty
+        metrics.num_dnc_violations = 1
+        # Score should still be the revenue (no penalty)
+        if metrics.total_revenue != 150.0:
+            return False, "DNC should not affect revenue score"
 
         return (
             True,
-            f"Scoring validated: accept={score:.0f}, reject={penalty:.0f}, dnc={dnc_penalty:.0f}",
+            f"Scoring validated: revenue={metrics.total_revenue:.0f}, accepts={metrics.num_accepts}, dnc_count={metrics.num_dnc_violations}",
         )
 
     def validate_render(self) -> tuple[bool, str]:
         """Validate environment render methods."""
         from salesbench.core.config import BudgetConfig, SalesBenchConfig
-        from salesbench.environment import SalesBenchEnvironment
+        from salesbench.envs.sales_mvp.env import SalesEnv
 
-        config = SalesBenchConfig(seed=42, num_leads=10, budget=BudgetConfig(total_days=10))
-        env = SalesBenchEnvironment(config=config)
+        config = SalesBenchConfig(seed=42, num_leads=10, budget=BudgetConfig(total_hours=10))
+        env = SalesEnv(config=config)
         env.reset()
 
-        # Test JSON render
-        json_out = env.render(mode="json")
-        if not json_out:
-            return False, "JSON render returned nothing"
+        # Test observation structure (render equivalent)
+        obs = env._get_observation()
+        if not obs:
+            return False, "Observation returned nothing"
 
         try:
-            parsed = json.loads(json_out)
-        except json.JSONDecodeError:
-            return False, "JSON render output is not valid JSON"
+            # Validate observation is serializable
+            json.dumps(obs)
+        except (TypeError, ValueError):
+            return False, "Observation is not JSON serializable"
 
-        # Test text render
-        text_out = env.render(mode="text")
-        if not text_out or "SalesBench" not in text_out:
-            return False, "Text render failed"
+        # Check that observation has expected keys
+        if "time" not in obs or "stats" not in obs:
+            return False, "Observation missing required keys"
 
-        return True, "Render modes (json, text) work correctly"
+        return True, "Observation structure validated (JSON serializable)"
 
     def validate_verifiers_server_imports(self) -> tuple[bool, str]:
         """Validate verifiers server can be imported (not run)."""

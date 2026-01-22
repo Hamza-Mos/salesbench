@@ -7,9 +7,13 @@ Tools:
 - crm.log_call: Log a completed call
 """
 
+import logging
 from typing import TYPE_CHECKING, Any, Optional
 
+from salesbench.core.config import BudgetConfig
 from salesbench.core.types import LeadID, ToolResult
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from salesbench.envs.sales_mvp.state import EnvironmentState
@@ -18,8 +22,9 @@ if TYPE_CHECKING:
 class CRMTools:
     """CRM tool implementations."""
 
-    def __init__(self, state: "EnvironmentState"):
+    def __init__(self, state: "EnvironmentState", budget: Optional[BudgetConfig] = None):
         self.state = state
+        self.budget = budget or BudgetConfig()
 
     def search_leads(
         self,
@@ -39,6 +44,20 @@ class CRMTools:
         Returns:
             ToolResult with matching leads.
         """
+        # Validate temperature if provided
+        if temperature:
+            from salesbench.core.types import LeadTemperature
+            valid_temps = [t.value for t in LeadTemperature]
+            if temperature not in valid_temps:
+                return ToolResult(
+                    call_id="error",
+                    success=False,
+                    error=f"Invalid temperature: '{temperature}'. Valid options: {valid_temps}",
+                )
+
+        # Advance time for search cost
+        self.state.time.advance_minutes(self.budget.search_cost, self.budget)
+
         leads = self.state.search_leads(
             temperature=temperature,
             min_income=min_income,
@@ -46,21 +65,16 @@ class CRMTools:
             limit=limit,
         )
 
+        filters = {k: v for k, v in {"temperature": temperature, "min_income": min_income, "max_age": max_age}.items() if v is not None}
+        logger.info(f"[SELLER:crm.search_leads] Found {len(leads)} leads (filters: {filters or 'none'})")
+
         return ToolResult(
             call_id="",  # Will be set by executor
             success=True,
             data={
                 "leads": [lead.to_public_dict() for lead in leads],
                 "total_found": len(leads),
-                "filters_applied": {
-                    k: v
-                    for k, v in {
-                        "temperature": temperature,
-                        "min_income": min_income,
-                        "max_age": max_age,
-                    }.items()
-                    if v is not None
-                },
+                "filters_applied": filters,
             },
         )
 
@@ -75,12 +89,14 @@ class CRMTools:
         """
         lead = self.state.get_lead(LeadID(lead_id))
         if not lead:
+            logger.warning(f"[SELLER:crm.get_lead] Lead not found: {lead_id}")
             return ToolResult(
-                call_id="",
+                call_id="error",
                 success=False,
                 error=f"Lead not found: {lead_id}",
             )
 
+        logger.debug(f"[SELLER:crm.get_lead] Retrieved lead {lead.name} (ID: {lead_id})")
         return ToolResult(
             call_id="",
             success=True,
@@ -106,7 +122,7 @@ class CRMTools:
         lead = self.state.get_lead(LeadID(lead_id))
         if not lead:
             return ToolResult(
-                call_id="",
+                call_id="error",
                 success=False,
                 error=f"Lead not found: {lead_id}",
             )
@@ -123,12 +139,14 @@ class CRMTools:
             try:
                 lead.temperature = LeadTemperature(temperature)
             except ValueError:
+                logger.warning(f"[SELLER:crm.update_lead] Invalid temperature: {temperature}")
                 return ToolResult(
-                    call_id="",
+                    call_id="error",
                     success=False,
                     error=f"Invalid temperature: {temperature}",
                 )
 
+        logger.info(f"[SELLER:crm.update_lead] Updated lead {lead.name} (notes: {bool(notes)}, temp: {temperature or 'unchanged'})")
         return ToolResult(
             call_id="",
             success=True,
@@ -160,14 +178,14 @@ class CRMTools:
         lead = self.state.get_lead(LeadID(lead_id))
         if not lead:
             return ToolResult(
-                call_id="",
+                call_id="error",
                 success=False,
                 error=f"Lead not found: {lead_id}",
             )
 
         # Update lead's call count
         lead.call_count += 1
-        lead.last_contact_day = self.state.time.current_day
+        lead.last_contact_hour = self.state.time.elapsed_hours
 
         if notes:
             if lead.notes:
@@ -175,6 +193,7 @@ class CRMTools:
             else:
                 lead.notes = f"Call {call_id}: {notes}"
 
+        logger.info(f"[SELLER:crm.log_call] Logged call to {lead.name} (outcome: {outcome}, total calls: {lead.call_count})")
         return ToolResult(
             call_id="",
             success=True,
@@ -209,7 +228,7 @@ class CRMTools:
         elif method_name == "get_lead":
             if "lead_id" not in arguments:
                 return ToolResult(
-                    call_id="",
+                    call_id="error",
                     success=False,
                     error="Missing required argument: lead_id",
                 )
@@ -217,7 +236,7 @@ class CRMTools:
         elif method_name == "update_lead":
             if "lead_id" not in arguments:
                 return ToolResult(
-                    call_id="",
+                    call_id="error",
                     success=False,
                     error="Missing required argument: lead_id",
                 )
@@ -231,7 +250,7 @@ class CRMTools:
             missing = [r for r in required if r not in arguments]
             if missing:
                 return ToolResult(
-                    call_id="",
+                    call_id="error",
                     success=False,
                     error=f"Missing required arguments: {missing}",
                 )
@@ -243,7 +262,7 @@ class CRMTools:
             )
         else:
             return ToolResult(
-                call_id="",
+                call_id="error",
                 success=False,
                 error=f"Unknown CRM tool: {tool_name}",
             )

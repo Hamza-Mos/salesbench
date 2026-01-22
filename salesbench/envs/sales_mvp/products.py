@@ -25,49 +25,63 @@ COVERAGE_AMOUNTS = {
 
 # Base rates per $1000 of coverage (monthly)
 # Indexed by age band
+# Rates calibrated to 2024-2026 US insurance market benchmarks
 BASE_RATES = {
     PlanType.TERM: {
-        # Age bands: 25-34, 35-44, 45-54, 55-64, 65+
-        "25-34": 0.08,
-        "35-44": 0.12,
-        "45-54": 0.25,
-        "55-64": 0.55,
-        "65+": 1.20,
+        # Adjusted down ~25% to match real-world data
+        # Example: 30yo, $500k, 20yr = $30/mo
+        "25-34": 0.06,
+        "35-44": 0.10,
+        "45-54": 0.20,
+        "55-64": 0.45,
+        "65+": 1.00,
     },
     PlanType.WHOLE: {
-        "25-34": 0.85,
-        "35-44": 1.10,
-        "45-54": 1.50,
-        "55-64": 2.20,
-        "65+": 3.50,
+        # Already realistic - minor adjustments
+        # Example: 30yo, $250k = $200/mo
+        "25-34": 0.80,
+        "35-44": 1.05,
+        "45-54": 1.45,
+        "55-64": 2.10,
+        "65+": 3.30,
     },
     PlanType.UL: {
-        "25-34": 0.65,
-        "35-44": 0.85,
-        "45-54": 1.15,
-        "55-64": 1.70,
-        "65+": 2.80,
+        # Reduced ~40% to match real-world data
+        # Example: 30yo, $250k = $95/mo
+        "25-34": 0.38,
+        "35-44": 0.52,
+        "45-54": 0.75,
+        "55-64": 1.10,
+        "65+": 1.80,
     },
     PlanType.VUL: {
-        "25-34": 0.70,
-        "35-44": 0.90,
-        "45-54": 1.25,
-        "55-64": 1.85,
-        "65+": 3.00,
-    },
-    PlanType.LTC: {
-        "25-34": 0.15,
-        "35-44": 0.25,
-        "45-54": 0.50,
-        "55-64": 1.00,
+        # Reduced ~35% - VUL typically slightly more than UL
+        # Example: 30yo, $250k = $105/mo
+        "25-34": 0.42,
+        "35-44": 0.58,
+        "45-54": 0.82,
+        "55-64": 1.20,
         "65+": 2.00,
     },
+    PlanType.LTC: {
+        # Already reasonable - minor adjustments for realism
+        # Example: 55yo, $150k pool = $135/mo
+        "25-34": 0.12,
+        "35-44": 0.20,
+        "45-54": 0.45,
+        "55-64": 0.90,
+        "65+": 1.80,
+    },
     PlanType.DI: {
-        "25-34": 1.50,
-        "35-44": 1.80,
-        "45-54": 2.20,
-        "55-64": 2.80,
-        "65+": 3.50,
+        # MAJOR INCREASE: ~20x higher to match reality
+        # DI typically costs 1-3% of annual income
+        # For $5k/mo benefit (~$60k/yr income), expect $100-200/mo
+        # Example: 30yo, $5k/mo benefit = $140/mo
+        "25-34": 28.0,
+        "35-44": 34.0,
+        "45-54": 42.0,
+        "55-64": 55.0,
+        "65+": 70.0,
     },
 }
 
@@ -86,6 +100,14 @@ TERM_MULTIPLIERS = {
     15: 0.90,
     20: 1.00,
     30: 1.25,
+}
+
+# Waiting period multipliers for DI/LTC (90 days = baseline)
+WAITING_PERIOD_MULTIPLIERS = {
+    30: 1.35,
+    60: 1.15,
+    90: 1.00,
+    180: 0.80,
 }
 
 
@@ -256,6 +278,7 @@ class ProductCatalog:
         coverage_amount: float,
         risk_class: RiskClass = RiskClass.STANDARD_PLUS,
         term_years: Optional[int] = None,
+        waiting_period_days: Optional[int] = None,
     ) -> dict[str, Any]:
         """Calculate monthly premium for a plan.
 
@@ -265,6 +288,7 @@ class ProductCatalog:
             coverage_amount: Coverage amount in dollars.
             risk_class: Risk classification.
             term_years: Term length (for TERM plans).
+            waiting_period_days: Elimination period for DI/LTC (30, 60, 90, or 180 days).
 
         Returns:
             Dict with premium quote details.
@@ -276,6 +300,13 @@ class ProductCatalog:
         # Validate age
         if age < product.min_age or age > product.max_age:
             return {"error": f"Age {age} outside valid range {product.min_age}-{product.max_age}"}
+
+        # Provide specific error for DI with coverage_amount=0
+        if plan_id == PlanType.DI and coverage_amount == 0:
+            return {
+                "error": "For DI plans, coverage_amount is the monthly benefit (e.g., 5000 for $5k/month). "
+                "Valid range: $1,000-$15,000/month."
+            }
 
         # Validate coverage
         if coverage_amount < product.min_coverage or coverage_amount > product.max_coverage:
@@ -289,6 +320,13 @@ class ProductCatalog:
                 term_years = 20  # Default
             if term_years not in TERM_MULTIPLIERS:
                 return {"error": f"Invalid term length. Options: {list(TERM_MULTIPLIERS.keys())}"}
+
+        # Validate waiting_period_days only for DI/LTC
+        if waiting_period_days is not None and plan_id not in (PlanType.DI, PlanType.LTC):
+            return {
+                "error": f"waiting_period_days is only applicable to DI and LTC plans, not {plan_id.value}. "
+                "Life insurance (TERM/WHOLE/UL/VUL) does not have waiting periods."
+            }
 
         # Calculate premium
         age_band = get_age_band(age)
@@ -329,17 +367,26 @@ class ProductCatalog:
             cv_ratio = 0.35 if plan_id == PlanType.WHOLE else 0.30
             result["projected_cash_value_year_10"] = round(total_paid_10yr * cv_ratio, 2)
 
+        # Handle waiting period for DI and LTC
+        if plan_id in (PlanType.DI, PlanType.LTC):
+            wait_days = waiting_period_days or 90  # Default to 90
+            if wait_days not in WAITING_PERIOD_MULTIPLIERS:
+                return {"error": f"Invalid waiting period. Options: {list(WAITING_PERIOD_MULTIPLIERS.keys())} days"}
+            monthly_premium *= WAITING_PERIOD_MULTIPLIERS[wait_days]
+            monthly_premium = round(monthly_premium, 2)
+            result["monthly_premium"] = monthly_premium
+            result["annual_premium"] = round(monthly_premium * 12, 2)
+            result["waiting_period"] = f"{wait_days} days"
+
         if plan_id == PlanType.DI:
             # DI uses monthly benefit instead of coverage
             result["monthly_benefit"] = coverage_amount
             result["benefit_period"] = "To age 65"
-            result["waiting_period"] = "90 days"
             del result["coverage_amount"]
 
         if plan_id == PlanType.LTC:
             result["daily_benefit"] = round(coverage_amount / 1095, 2)  # 3-year pool
             result["benefit_period"] = "3 years"
-            result["waiting_period"] = "90 days"
 
         return result
 

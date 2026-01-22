@@ -10,6 +10,7 @@ from typing import Any, Optional
 from salesbench.core.config import PersonaGenerationConfig
 from salesbench.core.types import (
     LeadID,
+    LeadStatus,
     LeadTemperature,
     ObjectionStyle,
     RiskClass,
@@ -160,8 +161,9 @@ ARCHETYPES = [
     },
 ]
 
-# First names for persona generation
+# First names for persona generation (diverse US demographics)
 FIRST_NAMES = [
+    # Traditional American
     "James",
     "Mary",
     "John",
@@ -258,9 +260,72 @@ FIRST_NAMES = [
     "Janet",
     "Dennis",
     "Catherine",
+    # Hispanic/Latino names
+    "Maria",
+    "Jose",
+    "Carlos",
+    "Rosa",
+    "Miguel",
+    "Ana",
+    "Luis",
+    "Carmen",
+    "Juan",
+    "Sofia",
+    "Diego",
+    "Isabella",
+    "Alejandro",
+    "Gabriela",
+    "Ricardo",
+    "Lucia",
+    "Fernando",
+    "Elena",
+    "Javier",
+    "Valentina",
+    # Asian names
+    "Wei",
+    "Mei",
+    "Hiroshi",
+    "Yuki",
+    "Kenji",
+    "Sakura",
+    "Jin",
+    "Min",
+    "Ravi",
+    "Priya",
+    "Raj",
+    "Anita",
+    "Amit",
+    "Sunita",
+    "Deepak",
+    "Kavita",
+    "Tao",
+    "Ling",
+    # Middle Eastern names
+    "Omar",
+    "Fatima",
+    "Ahmed",
+    "Layla",
+    "Hassan",
+    "Noor",
+    "Ali",
+    "Zahra",
+    "Khalid",
+    "Amira",
+    # African American names
+    "Malik",
+    "Aaliyah",
+    "Jamal",
+    "Imani",
+    "Darnell",
+    "Keisha",
+    "Tyrone",
+    "Latoya",
+    "DeShawn",
+    "Ebony",
 ]
 
 LAST_NAMES = [
+    # Common American surnames
     "Smith",
     "Johnson",
     "Williams",
@@ -311,12 +376,52 @@ LAST_NAMES = [
     "Mitchell",
     "Carter",
     "Roberts",
+    # Asian surnames
     "Chen",
     "Kim",
     "Patel",
     "Singh",
     "Kumar",
+    "Wang",
+    "Li",
+    "Zhang",
+    "Liu",
+    "Huang",
+    "Lin",
+    "Wu",
+    "Yang",
+    "Tanaka",
+    "Yamamoto",
+    "Suzuki",
+    "Takahashi",
+    "Park",
+    "Choi",
+    # Middle Eastern surnames
+    "Khan",
+    "Ali",
+    "Ahmed",
+    "Hassan",
+    "Mohammad",
+    "Ibrahim",
+    "Nasser",
+    # Jewish surnames
     "Cohen",
+    "Levy",
+    "Goldberg",
+    "Friedman",
+    "Schwartz",
+    "Rosenberg",
+    # Hispanic surnames
+    "Morales",
+    "Cruz",
+    "Reyes",
+    "Diaz",
+    "Vargas",
+    "Castillo",
+    "Moreno",
+    "Jimenez",
+    "Ruiz",
+    "Ortiz",
 ]
 
 
@@ -327,7 +432,6 @@ class HiddenState:
     trust: float  # 0.0-1.0, affects acceptance
     interest: float  # 0.0-1.0, affects engagement
     patience: float  # 0.0-1.0, how long before hanging up
-    dnc_risk: float  # 0.0-1.0, probability of requesting DNC
     close_threshold: float  # Premium-to-income ratio they'll accept
 
     def to_dict(self) -> dict[str, Any]:
@@ -336,7 +440,6 @@ class HiddenState:
             "trust": self.trust,
             "interest": self.interest,
             "patience": self.patience,
-            "dnc_risk": self.dnc_risk,
             "close_threshold": self.close_threshold,
         }
 
@@ -365,7 +468,13 @@ class Persona:
     # CRM metadata
     notes: str = ""
     call_count: int = 0
-    last_contact_day: Optional[int] = None
+    last_contact_hour: Optional[int] = None
+
+    # Lead lifecycle status (for natural termination)
+    status: LeadStatus = LeadStatus.ACTIVE
+    rejection_count: int = 0  # Track rejections for analytics
+
+    # Legacy fields (kept for backwards compatibility, derived from status)
     on_dnc_list: bool = False
     converted: bool = False  # True once the lead has accepted a plan
 
@@ -386,7 +495,9 @@ class Persona:
             "risk_class": self.risk_class.value,
             "notes": self.notes,
             "call_count": self.call_count,
-            "last_contact_day": self.last_contact_day,
+            "last_contact_hour": self.last_contact_hour,
+            "status": self.status.value,
+            "rejection_count": self.rejection_count,
             "on_dnc_list": self.on_dnc_list,
             "converted": self.converted,
         }
@@ -468,31 +579,11 @@ class PersonaGenerator:
 
         # Adjust based on temperature
         temp_modifiers = {
-            LeadTemperature.HOT: {"trust": 0.3, "interest": 0.4, "patience": 0.3, "dnc_risk": -0.2},
-            LeadTemperature.WARM: {
-                "trust": 0.15,
-                "interest": 0.2,
-                "patience": 0.15,
-                "dnc_risk": -0.1,
-            },
-            LeadTemperature.LUKEWARM: {
-                "trust": 0.0,
-                "interest": 0.0,
-                "patience": 0.0,
-                "dnc_risk": 0.0,
-            },
-            LeadTemperature.COLD: {
-                "trust": -0.15,
-                "interest": -0.2,
-                "patience": -0.1,
-                "dnc_risk": 0.1,
-            },
-            LeadTemperature.HOSTILE: {
-                "trust": -0.3,
-                "interest": -0.3,
-                "patience": -0.3,
-                "dnc_risk": 0.3,
-            },
+            LeadTemperature.HOT: {"trust": 0.3, "interest": 0.4, "patience": 0.3},
+            LeadTemperature.WARM: {"trust": 0.15, "interest": 0.2, "patience": 0.15},
+            LeadTemperature.LUKEWARM: {"trust": 0.0, "interest": 0.0, "patience": 0.0},
+            LeadTemperature.COLD: {"trust": -0.15, "interest": -0.2, "patience": -0.1},
+            LeadTemperature.HOSTILE: {"trust": -0.3, "interest": -0.3, "patience": -0.3},
         }
 
         mods = temp_modifiers[temperature]
@@ -501,7 +592,6 @@ class PersonaGenerator:
         trust = max(0.0, min(1.0, base_trust + mods["trust"] + self._rng.gauss(0, 0.1)))
         interest = max(0.0, min(1.0, base_interest + mods["interest"] + self._rng.gauss(0, 0.1)))
         patience = max(0.1, min(1.0, 0.5 + mods["patience"] + self._rng.gauss(0, 0.15)))
-        dnc_risk = max(0.0, min(0.8, 0.1 + mods["dnc_risk"] + self._rng.gauss(0, 0.05)))
 
         # Close threshold: what % of monthly income they'd pay for insurance
         # Higher interest = willing to pay more
@@ -512,7 +602,6 @@ class PersonaGenerator:
             trust=trust,
             interest=interest,
             patience=patience,
-            dnc_risk=dnc_risk,
             close_threshold=close_threshold,
         )
 

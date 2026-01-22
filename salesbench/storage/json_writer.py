@@ -180,6 +180,16 @@ class JSONResultsWriter:
                 data = self.load_result(path)
                 config = data.get("config", {})
                 aggregate = data.get("aggregate_metrics", {})
+                token_usage = aggregate.get("total_token_usage", {})
+                cost_breakdown = aggregate.get("total_cost_breakdown", {})
+
+                # Calculate total tokens
+                total_tokens = (
+                    token_usage.get("seller_input_tokens", 0) +
+                    token_usage.get("seller_output_tokens", 0) +
+                    token_usage.get("buyer_input_tokens", 0) +
+                    token_usage.get("buyer_output_tokens", 0)
+                )
 
                 results.append(
                     {
@@ -196,6 +206,12 @@ class JSONResultsWriter:
                         "mean_offers": aggregate.get("mean_offers", 0),
                         "timestamp": data.get("started_at", ""),
                         "duration_seconds": data.get("duration_seconds", 0),
+                        # New metrics
+                        "total_tokens": total_tokens,
+                        "total_cost": cost_breakdown.get("total_cost", 0),
+                        "mean_action_based_minutes": aggregate.get("mean_action_based_minutes", 0),
+                        "mean_token_based_minutes": aggregate.get("mean_token_based_minutes", 0),
+                        "mean_conversation_turns": aggregate.get("mean_conversation_turns", 0),
                     }
                 )
             except Exception as e:

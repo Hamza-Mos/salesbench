@@ -78,6 +78,7 @@ class ProductTools:
         coverage_amount: float,
         risk_class: Optional[str] = None,
         term_years: Optional[int] = None,
+        waiting_period_days: Optional[int] = None,
     ) -> ToolResult:
         """Get a premium quote for a plan.
 
@@ -119,6 +120,7 @@ class ProductTools:
             coverage_amount=coverage_amount,
             risk_class=risk,
             term_years=term_years,
+            waiting_period_days=waiting_period_days,
         )
 
         if "error" in quote:
@@ -131,7 +133,14 @@ class ProductTools:
         return ToolResult(
             call_id="",
             success=True,
-            data={"quote": quote},
+            data={
+                "quote": quote,
+                "message": (
+                    f"Quote ready: {quote['plan_name']} - "
+                    f"${quote['monthly_premium']}/month for ${coverage_amount} coverage. "
+                    "Use calling.propose_plan to present this offer to the buyer."
+                ),
+            },
         )
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
@@ -173,6 +182,7 @@ class ProductTools:
                 coverage_amount=arguments["coverage_amount"],
                 risk_class=arguments.get("risk_class"),
                 term_years=arguments.get("term_years"),
+                waiting_period_days=arguments.get("waiting_period_days"),
             )
 
         else:

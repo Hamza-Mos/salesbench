@@ -16,6 +16,7 @@ from salesbench.core.errors import (
 )
 from salesbench.core.protocol import SELLER_TOOLS
 from salesbench.core.types import (
+    LeadStatus,
     ToolCall,
     ToolResult,
 )
@@ -61,7 +62,7 @@ class SalesEnv:
         )
 
         # Initialize tools
-        self._crm_tools = CRMTools(self._state)
+        self._crm_tools = CRMTools(self._state, self.config.budget)
         self._calendar_tools = CalendarTools(self._state, self.config.budget)
         self._calling_tools = CallingTools(self._state, self.config.budget)
         self._product_tools = ProductTools(self._state, self._catalog)
@@ -104,7 +105,7 @@ class SalesEnv:
         self._termination_reason = None
 
         # Reset tools with new state
-        self._crm_tools = CRMTools(self._state)
+        self._crm_tools = CRMTools(self._state, self.config.budget)
         self._calendar_tools = CalendarTools(self._state, self.config.budget)
         self._calling_tools = CallingTools(self._state, self.config.budget)
         self._product_tools = ProductTools(self._state, self._catalog)
@@ -190,14 +191,7 @@ class SalesEnv:
         if self._terminated:
             raise EpisodeTerminated(self._termination_reason or "Episode ended")
 
-        # Check tool call budget
-        if self._state.tool_calls_this_turn >= self.config.budget.max_tool_calls_per_turn:
-            raise BudgetExceeded(
-                f"Tool call limit exceeded: {self.config.budget.max_tool_calls_per_turn}",
-                budget_type="tool_calls_per_turn",
-                limit=self.config.budget.max_tool_calls_per_turn,
-                current=self._state.tool_calls_this_turn,
-            )
+        # No artificial tool call limit - let agents work naturally
 
         # Validate tool name
         if tool_call.tool_name not in SELLER_TOOLS:
@@ -253,11 +247,6 @@ class SalesEnv:
             Current observation dict.
         """
         self._state.reset_turn()
-
-        # Check if day ended
-        if self._state.time.is_end_of_day():
-            self._state.reset_day()
-
         return self._get_observation()
 
     def _route_tool_call(self, tool_call: ToolCall) -> ToolResult:
@@ -285,20 +274,27 @@ class SalesEnv:
         # Time-based termination
         if self._state.time.is_episode_ended(self.config.budget):
             self._terminated = True
-            self._termination_reason = "Episode time ended (10 days)"
+            self._termination_reason = f"Episode time ended ({self.config.budget.total_hours} hours)"
             return
 
-        # All leads exhausted (all on DNC or already sold)
-        active_leads = sum(1 for lead in self._state.leads.values() if not lead.on_dnc_list)
+        # All leads exhausted (converted or DNC)
+        active_leads = sum(
+            1 for lead in self._state.leads.values()
+            if lead.status == LeadStatus.ACTIVE
+        )
         if active_leads == 0:
             self._terminated = True
-            self._termination_reason = "No more leads available"
+            self._termination_reason = "No more leads available (all resolved)"
             return
 
     def _get_observation(self) -> dict[str, Any]:
         """Get the current observation for the agent."""
+        time_dict = self._state.time.to_dict()
+        # Add remaining_minutes for convenience
+        total_minutes_budget = self.config.budget.total_hours * 60
+        time_dict["remaining_minutes"] = max(0, total_minutes_budget - time_dict["total_minutes"])
         return {
-            "time": self._state.time.to_dict(),
+            "time": time_dict,
             "stats": self._state.stats.to_dict(),
             "has_active_call": self._state.active_call is not None,
             "active_call": (

@@ -5,20 +5,35 @@ and storage integrations.
 """
 
 import asyncio
-import json
 import logging
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Table
 
 from salesbench.runner.config import BenchmarkConfig, RunMode
 from salesbench.runner.executor import EpisodeExecutor
 from salesbench.runner.integrations import IntegrationManager
-from salesbench.runner.results import BenchmarkResult, EpisodeResult
+from salesbench.runner.results import BenchmarkResult, EpisodeProgress, EpisodeResult
 from salesbench.storage.json_writer import JSONResultsWriter
 
 logger = logging.getLogger(__name__)
+console = Console()
 
 
 class BenchmarkRunner:
@@ -101,8 +116,11 @@ class BenchmarkRunner:
 
             # Log context window info if available
             if seller_spec and seller_spec.config:
-                trigger = seller_spec.config.compression_trigger
-                self.output_callback(f"Seller context threshold: {trigger:,} tokens")
+                seller_trigger = seller_spec.config.compression_trigger
+                self.output_callback(f"Seller context threshold: {seller_trigger:,} tokens")
+            if buyer_spec and buyer_spec.config:
+                buyer_trigger = buyer_spec.config.compression_trigger
+                self.output_callback(f"Buyer context threshold: {buyer_trigger:,} tokens")
 
             self.output_callback(
                 f"Supabase: {'enabled' if self.integrations.supabase_enabled else 'disabled'}"
@@ -172,7 +190,7 @@ class BenchmarkRunner:
         seller_model_spec=None,
         buyer_model_spec=None,
     ) -> list[EpisodeResult]:
-        """Run all episodes with controlled parallelism.
+        """Run all episodes with controlled parallelism and real-time progress.
 
         Args:
             seller_config: Config dict to create seller agents (provider, model).
@@ -185,76 +203,187 @@ class BenchmarkRunner:
         """
         results = []
         total = self.config.num_episodes
+        budget = self.config.episode_config.budget
 
-        if self.config.parallelism == 1:
-            # Sequential execution - guarantees order
-            for i in range(total):
-                ep_result = await self._run_single_episode(
-                    episode_index=i,
-                    seller_config=seller_config,
-                    buyer_simulator=buyer_simulator,
-                    seller_model_spec=seller_model_spec,
-                    buyer_model_spec=buyer_model_spec,
-                )
-                results.append(ep_result)
-                self._print_episode_progress(ep_result, completed_count=None)
-        else:
-            # Parallel execution with semaphore
-            semaphore = asyncio.Semaphore(self.config.parallelism)
-            completed = 0
+        # Track per-episode progress (thread-safe via lock)
+        episode_progress: dict[int, EpisodeProgress] = {}
+        progress_lock = threading.Lock()
+        completed_episodes: list[tuple[int, EpisodeResult]] = []
+        # Track last reported turn per episode for periodic verbose summaries
+        last_verbose_turn: dict[int, int] = {}
 
-            async def run_with_semaphore(episode_index: int) -> EpisodeResult:
-                async with semaphore:
-                    return await self._run_single_episode(
-                        episode_index=episode_index,
+        def on_progress(p: EpisodeProgress) -> None:
+            """Thread-safe progress callback."""
+            with progress_lock:
+                episode_progress[p.episode_index] = p
+
+                # In verbose mode, print periodic progress summaries
+                if self.config.verbose:
+                    last_turn = last_verbose_turn.get(p.episode_index, 0)
+                    if p.turn >= last_turn + self.config.progress_interval or p.turn == 1:
+                        last_verbose_turn[p.episode_index] = p.turn
+                        resolved = p.leads_converted + p.leads_dnc
+                        status = f"calling {p.current_lead_id}" if p.in_call else "between calls"
+                        self.output_callback(
+                            f"[Ep {p.episode_index + 1}] PROGRESS: "
+                            f"turn {p.turn}, time {int(p.elapsed_hours)}h{int(p.elapsed_minutes):02d}m/{p.total_hours}h, "
+                            f"leads {resolved}/{p.total_leads} ({p.leads_converted} converted, {p.leads_dnc} dnc), "
+                            f"{status}"
+                        )
+
+        def build_progress_table() -> Table:
+            """Build a table showing all active episode progress."""
+            table = Table(box=None, show_header=False, padding=(0, 1))
+            table.add_column("Episode", style="cyan", width=12)
+            table.add_column("Time", width=30)
+            table.add_column("Leads", width=40)
+            table.add_column("Status", width=20)
+
+            with progress_lock:
+                if not episode_progress:
+                    # Show placeholder while waiting for first progress
+                    table.add_row(
+                        "[dim]Starting...[/dim]",
+                        "[dim]Waiting for episodes[/dim]",
+                        "",
+                        "[dim]Initializing[/dim]",
+                    )
+                    return table
+
+                # Sort by episode index for consistent display
+                for ep_idx in sorted(episode_progress.keys()):
+                    p = episode_progress[ep_idx]
+
+                    # Time progress bar
+                    time_pct = p.time_progress
+                    time_filled = int(time_pct * 20)
+                    time_bar = "█" * time_filled + "░" * (20 - time_filled)
+                    time_str = f"[yellow]{time_bar}[/yellow] {int(p.elapsed_hours)}h{int(p.elapsed_minutes):02d}m/{p.total_hours}h"
+
+                    # Leads progress
+                    resolved = p.leads_converted + p.leads_dnc
+                    lead_pct = resolved / p.total_leads if p.total_leads > 0 else 0
+                    lead_filled = int(lead_pct * 20)
+                    lead_bar = "█" * lead_filled + "░" * (20 - lead_filled)
+                    lead_str = (
+                        f"[green]{lead_bar}[/green] "
+                        f"{resolved}/{p.total_leads} "
+                        f"([green]{p.leads_converted}[/green]✓ "
+                        f"[red]{p.leads_dnc}[/red]✗)"
+                    )
+
+                    # Status
+                    if p.in_call:
+                        status = f"[blue]📞 {p.current_lead_id}[/blue]"
+                    else:
+                        status = f"[dim]Turn {p.turn}[/dim]"
+
+                    table.add_row(
+                        f"Ep {ep_idx + 1}/{total}",
+                        time_str,
+                        lead_str,
+                        status,
+                    )
+
+            return table
+
+        async def run_episodes_core():
+            """Core episode execution logic."""
+            if self.config.parallelism == 1:
+                # Sequential execution
+                for i in range(total):
+                    ep_result = await self._run_single_episode(
+                        episode_index=i,
                         seller_config=seller_config,
                         buyer_simulator=buyer_simulator,
                         seller_model_spec=seller_model_spec,
                         buyer_model_spec=buyer_model_spec,
+                        progress_callback=on_progress,
                     )
+                    results.append(ep_result)
+                    with progress_lock:
+                        episode_progress.pop(i, None)  # Remove completed
+                    completed_episodes.append((i, ep_result))
+            else:
+                # Parallel execution with semaphore
+                semaphore = asyncio.Semaphore(self.config.parallelism)
 
-            # Create tasks for all episodes
-            tasks = [run_with_semaphore(i) for i in range(total)]
+                async def run_with_semaphore(episode_index: int) -> tuple[int, EpisodeResult]:
+                    async with semaphore:
+                        result = await self._run_single_episode(
+                            episode_index=episode_index,
+                            seller_config=seller_config,
+                            buyer_simulator=buyer_simulator,
+                            seller_model_spec=seller_model_spec,
+                            buyer_model_spec=buyer_model_spec,
+                            progress_callback=on_progress,
+                        )
+                        with progress_lock:
+                            episode_progress.pop(episode_index, None)
+                        return (episode_index, result)
 
-            # Run with progress tracking (as_completed yields in completion order)
-            for coro in asyncio.as_completed(tasks):
-                ep_result = await coro
-                results.append(ep_result)
-                completed += 1
-                self._print_episode_progress(ep_result, completed_count=completed)
+                # Create and run all tasks
+                tasks = [run_with_semaphore(i) for i in range(total)]
+                for coro in asyncio.as_completed(tasks):
+                    ep_idx, ep_result = await coro
+                    results.append(ep_result)
+                    completed_episodes.append((ep_idx, ep_result))
+
+        # Skip Live display when verbose mode is enabled to avoid output corruption
+        if self.config.verbose:
+            # Run without Live display - verbose output provides feedback
+            await run_episodes_core()
+        else:
+            # Create Rich Live display for real-time updates
+            with Live(
+                Panel(build_progress_table(), title="Episode Progress", border_style="blue"),
+                console=console,
+                refresh_per_second=4,
+                transient=True,
+            ) as live:
+
+                async def update_display():
+                    """Periodically update the Live display."""
+                    while True:
+                        await asyncio.sleep(0.25)
+                        live.update(
+                            Panel(build_progress_table(), title="Episode Progress", border_style="blue")
+                        )
+
+                # Start display update task
+                display_task = asyncio.create_task(update_display())
+
+                try:
+                    await run_episodes_core()
+                finally:
+                    display_task.cancel()
+                    try:
+                        await display_task
+                    except asyncio.CancelledError:
+                        pass
+
+        # Print completion summary for each episode
+        for ep_idx, ep_result in sorted(completed_episodes, key=lambda x: x[0]):
+            self._print_episode_summary(ep_result)
 
         return results
 
-    def _print_episode_progress(
-        self, ep_result: EpisodeResult, completed_count: int | None
-    ) -> None:
-        """Print progress for a completed episode.
-
-        Args:
-            ep_result: The episode result.
-            completed_count: If provided, shows "Completed X/Y" format for parallel mode.
-                           If None, shows "Episode X/Y" format for sequential mode.
-        """
-        status = "OK" if ep_result.succeeded else "FAIL"
+    def _print_episode_summary(self, ep_result: EpisodeResult) -> None:
+        """Print a completion summary for an episode."""
+        status_color = "green" if ep_result.succeeded else "red"
+        status_text = "✓" if ep_result.succeeded else "✗"
         accepts = ep_result.total_accepts
         score = ep_result.final_score
         duration = ep_result.duration_seconds
         total = self.config.num_episodes
 
-        if completed_count is None:
-            # Sequential mode: Episode 1/100 (seed=42): ...
-            self.output_callback(
-                f"Episode {ep_result.episode_index + 1}/{total} "
-                f"(seed={ep_result.seed}): score={score:.2f}, accepts={accepts} "
-                f"[{duration:.1f}s] [{status}]"
-            )
-        else:
-            # Parallel mode: Completed 1/100 [Episode 59] (seed=100): ...
-            self.output_callback(
-                f"Completed {completed_count}/{total} [Episode {ep_result.episode_index + 1}] "
-                f"(seed={ep_result.seed}): score={score:.2f}, accepts={accepts} "
-                f"[{duration:.1f}s] [{status}]"
-            )
+        msg = (
+            f"[{status_color}]{status_text}[/{status_color}] "
+            f"Episode {ep_result.episode_index + 1}/{total} "
+            f"(seed={ep_result.seed}): score={score:.2f}, accepts={accepts} "
+            f"[dim][{duration:.1f}s][/dim]"
+        )
+        console.print(msg)
 
     async def _run_single_episode(
         self,
@@ -263,19 +392,22 @@ class BenchmarkRunner:
         buyer_simulator: Callable,
         seller_model_spec=None,
         buyer_model_spec=None,
+        progress_callback: Optional[Callable] = None,
     ) -> EpisodeResult:
         """Run a single episode asynchronously.
 
         Args:
             episode_index: Zero-based episode index.
             seller_config: Config dict to create seller agent.
-            buyer_simulator: The buyer simulator.
+            buyer_simulator: The buyer simulator (used as template for config).
             seller_model_spec: Model specification for seller.
             buyer_model_spec: Model specification for buyer.
+            progress_callback: Optional callback for real-time progress updates.
 
         Returns:
             Episode result.
         """
+        from salesbench.agents.buyer_llm import LLMBuyerSimulator
         from salesbench.agents.seller_llm import LLMSellerAgent
 
         seed = self.config.get_episode_seed(episode_index)
@@ -292,6 +424,18 @@ class BenchmarkRunner:
             model=seller_config["model"],
         )
 
+        # Create a fresh buyer simulator for this episode (avoid state sharing in parallel runs)
+        # This ensures token tracking is accurate per-episode
+        if isinstance(buyer_simulator, LLMBuyerSimulator):
+            episode_buyer_simulator = LLMBuyerSimulator(
+                provider=buyer_simulator.provider,
+                model=buyer_simulator.model,
+                temperature=buyer_simulator.temperature,
+            )
+        else:
+            # Fallback for custom simulators - use as-is (user responsible for thread safety)
+            episode_buyer_simulator = buyer_simulator
+
         # Create episode-specific verbose callback with episode prefix
         def episode_verbose_callback(message: str) -> None:
             if self._verbose_callback:
@@ -299,15 +443,16 @@ class BenchmarkRunner:
                 self._verbose_callback(f"{prefix} {message}")
 
         # Run in executor to not block event loop
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             executor.run_episode,
             episode_index,
             seed,
             seller_agent,
-            buyer_simulator,
+            episode_buyer_simulator,  # Use per-episode buyer simulator
             episode_verbose_callback if self.config.verbose else None,
+            progress_callback,  # Pass through for real-time progress updates
         )
 
     def _create_agents(self):
@@ -406,7 +551,13 @@ class BenchmarkRunner:
         self.output_callback(f"Domain: {self.config.domain}")
         self.output_callback(f"Episodes: {self.config.num_episodes}")
         self.output_callback(f"Leads per episode: {self.config.num_leads}")
-        self.output_callback(f"Max turns per episode: {self.config.max_turns}")
+        # Budget settings
+        budget = self.config.episode_config.budget
+        self.output_callback(f"Budget: {budget.total_hours} hours")
+        if self.config.safety_max_turns:
+            self.output_callback(f"Safety limit: {self.config.safety_max_turns} turns")
+        else:
+            self.output_callback("Safety limit: None (natural termination only)")
         self.output_callback(f"Parallelism: {self.config.parallelism}")
         self.output_callback(f"Benchmark ID: {self.config.benchmark_id}")
 
@@ -433,16 +584,9 @@ class BenchmarkRunner:
             success_rate = metrics.get("episode_success_rate", 0) * 100
             self.output_callback(f"Episode success:    {success_rate:.1f}%")
 
-            pass_at_1 = metrics.get("pass_at_1", 0) * 100
-            self.output_callback(f"Pass@1:             {pass_at_1:.1f}%")
-
-            if metrics.get("pass_at_5"):
-                pass_at_5 = metrics.get("pass_at_5", 0) * 100
-                self.output_callback(f"Pass@5:             {pass_at_5:.1f}%")
-
-            if metrics.get("pass_at_10"):
-                pass_at_10 = metrics.get("pass_at_10", 0) * 100
-                self.output_callback(f"Pass@10:            {pass_at_10:.1f}%")
+            # Episode success rate (at least 1 conversion)
+            success_rate = metrics.get("episode_success_rate", 0) * 100
+            self.output_callback(f"Episode success:    {success_rate:.1f}%")
 
             total_duration = metrics.get("total_duration_seconds", result.duration_seconds)
             self.output_callback(f"Total duration:     {total_duration:.1f}s")

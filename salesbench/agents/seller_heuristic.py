@@ -34,7 +34,6 @@ class HeuristicState:
     offer_made: bool = False
     leads_queue: list[dict] = field(default_factory=list)
     called_leads: set = field(default_factory=set)
-    last_tool_results: list[ToolResult] = field(default_factory=list)
 
 
 class HeuristicSeller(SellerAgent):
@@ -136,7 +135,7 @@ class HeuristicSeller(SellerAgent):
                 self._prioritize_leads(data["leads"])
 
             # Handle call start
-            if "call_id" in data and "call_started" not in str(data):
+            if "call_id" in data and not data.get("call_started"):
                 self._state.call_active = True
 
             # Handle offer response

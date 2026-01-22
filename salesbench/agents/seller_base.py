@@ -7,14 +7,11 @@ tool(s) to call next.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 from salesbench.core.protocol import SellerAction, validate_seller_action
 from salesbench.core.types import ToolCall, ToolResult
-
-if TYPE_CHECKING:
-    pass
-
+from salesbench.models import get_model_config, is_supported_model
 
 @dataclass
 class SellerObservation:
@@ -24,8 +21,8 @@ class SellerObservation:
     """
 
     # Current environment state (what seller can see)
-    current_day: int
-    current_hour: int
+    elapsed_hours: int
+    elapsed_minutes: int
     remaining_minutes: int
 
     # Recent tool results
@@ -49,8 +46,8 @@ class SellerObservation:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
-            "current_day": self.current_day,
-            "current_hour": self.current_hour,
+            "elapsed_hours": self.elapsed_hours,
+            "elapsed_minutes": self.elapsed_minutes,
             "remaining_minutes": self.remaining_minutes,
             "last_tool_results": [r.to_dict() for r in self.last_tool_results],
             "in_call": self.in_call,
@@ -63,6 +60,51 @@ class SellerObservation:
             "total_dnc_violations": self.total_dnc_violations,
             "message": self.message,
         }
+
+    @classmethod
+    def from_dict(cls, obs_dict: dict) -> "SellerObservation":
+        """Create SellerObservation from orchestrator dict.
+
+        Args:
+            obs_dict: Dictionary from orchestrator with time, call, metrics info.
+
+        Returns:
+            SellerObservation instance.
+        """
+        time_info = obs_dict.get("time", {})
+        call_info = obs_dict.get("call", {})
+        metrics = obs_dict.get("metrics", {})
+
+        # Convert tool results if present
+        tool_results = []
+        for tr in obs_dict.get("last_tool_results", []):
+            if isinstance(tr, dict):
+                tool_results.append(
+                    ToolResult(
+                        call_id=tr.get("call_id", ""),
+                        success=tr.get("success", True),
+                        data=tr.get("data"),
+                        error=tr.get("error"),
+                    )
+                )
+            else:
+                tool_results.append(tr)
+
+        return cls(
+            elapsed_hours=time_info.get("elapsed_hours", 0),
+            elapsed_minutes=time_info.get("elapsed_minutes", 0),
+            remaining_minutes=time_info.get("remaining_minutes", 4800),
+            last_tool_results=tool_results,
+            in_call=call_info.get("in_call", False),
+            current_lead_id=call_info.get("current_lead_id"),
+            call_duration=call_info.get("duration", 0),
+            offers_this_call=call_info.get("offers_this_call", 0),
+            total_calls=metrics.get("total_calls", 0),
+            total_accepts=metrics.get("accepted_offers", 0),
+            total_rejects=metrics.get("rejected_offers", 0),
+            total_dnc_violations=metrics.get("dnc_violations", 0),
+            message=obs_dict.get("message"),
+        )
 
 
 @dataclass
@@ -178,26 +220,22 @@ class SellerAgent(ABC):
         Returns:
             Cost for this call.
         """
-        # Track tokens
         self._total_input_tokens += input_tokens
         self._total_output_tokens += output_tokens
 
-        # Approximate pricing per 1K tokens
-        pricing = {
-            "gpt-4o": {"input": 0.005, "output": 0.015},
-            "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
-            "gpt-4-turbo": {"input": 0.01, "output": 0.03},
-            "gpt-3.5-turbo": {"input": 0.0005, "output": 0.0015},
-            "claude-3-opus": {"input": 0.015, "output": 0.075},
-            "claude-3-sonnet": {"input": 0.003, "output": 0.015},
-            "claude-3-haiku": {"input": 0.00025, "output": 0.00125},
-        }
+        # Use centralized pricing from models.py
+        if is_supported_model(model):
+            config = get_model_config(model)
+            if config.input_price_per_million and config.output_price_per_million:
+                cost = (
+                    input_tokens * config.input_price_per_million / 1_000_000
+                    + output_tokens * config.output_price_per_million / 1_000_000
+                )
+                self._total_api_cost += cost
+                return cost
 
-        rates = pricing.get(model, {"input": 0.01, "output": 0.03})
-        cost = input_tokens / 1000 * rates["input"] + output_tokens / 1000 * rates["output"]
-
-        self._total_api_cost += cost
-        return cost
+        # Model not in registry - skip cost tracking (no fallback pricing)
+        return 0.0
 
     def get_token_usage(self) -> tuple[int, int]:
         """Get total token usage for this episode.
@@ -206,55 +244,3 @@ class SellerAgent(ABC):
             Tuple of (input_tokens, output_tokens).
         """
         return self._total_input_tokens, self._total_output_tokens
-
-
-class MultiAgentSeller(SellerAgent):
-    """Base class for multi-agent seller architectures.
-
-    Supports hierarchical or ensemble approaches where multiple
-    sub-agents collaborate on decisions.
-    """
-
-    def __init__(
-        self,
-        agents: list[SellerAgent],
-        config: Optional[SellerConfig] = None,
-    ):
-        """Initialize multi-agent seller.
-
-        Args:
-            agents: List of sub-agents.
-            config: Configuration for the orchestrator.
-        """
-        super().__init__(config)
-        self.agents = agents
-
-    @abstractmethod
-    def select_agent(self, observation: SellerObservation) -> SellerAgent:
-        """Select which agent should act.
-
-        Args:
-            observation: Current observation.
-
-        Returns:
-            The agent that should handle this turn.
-        """
-        pass
-
-    def act(self, observation: SellerObservation) -> SellerAction:
-        """Delegate to selected agent."""
-        agent = self.select_agent(observation)
-        return agent.act(observation)
-
-    def reset(self) -> None:
-        """Reset all sub-agents."""
-        for agent in self.agents:
-            agent.reset()
-        self._total_api_cost = 0.0
-        self._turn_count = 0
-
-    def get_stats(self) -> dict[str, Any]:
-        """Aggregate stats from all agents."""
-        stats = super().get_stats()
-        stats["agent_stats"] = [a.get_stats() for a in self.agents]
-        return stats

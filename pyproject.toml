@@ -28,6 +28,9 @@ dependencies = [
     "verifiers>=0.1.8",
     "datasets>=2.14.0",
     "openai>=1.0.0",
+    "anthropic>=0.18.0",
+    "google-generativeai>=0.4.0",
+    "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
@@ -81,8 +84,7 @@ packages = ["salesbench"]
 environment = "salesbench:load_environment"
 default_seed = 42
 num_leads = 100
-total_days = 10
-max_calls_per_day = 50
+total_hours = 80
 pass_threshold = 0
 
 [tool.verifiers.eval.metrics]

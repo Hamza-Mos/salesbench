@@ -1,7 +1,6 @@
 """Metrics and evaluation for SalesBench.
 
 This module provides:
-- pass@k computation for benchmark evaluation
 - Aggregation hooks for Prime Intellect integration
 - Episode metrics collection
 """
@@ -14,28 +13,13 @@ from salesbench.metrics.collectors import (
 from salesbench.metrics.hooks import (
     EpisodeMetricHook,
     MetricHook,
-    PassAtKHook,
     PrimeIntellectHook,
-)
-from salesbench.metrics.pass_at_k import (
-    PassAtKComputer,
-    PassAtKConfig,
-    PassAtKResult,
-    compute_pass_at_k,
-    estimate_pass_at_k,
 )
 
 __all__ = [
-    # pass@k
-    "PassAtKComputer",
-    "PassAtKConfig",
-    "PassAtKResult",
-    "compute_pass_at_k",
-    "estimate_pass_at_k",
     # Hooks
     "MetricHook",
     "EpisodeMetricHook",
-    "PassAtKHook",
     "PrimeIntellectHook",
     # Collectors
     "MetricCollector",

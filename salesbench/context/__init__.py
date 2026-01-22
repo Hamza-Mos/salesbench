@@ -2,24 +2,30 @@
 
 Provides episode context management with:
 - Anchored state (critical info that survives compaction)
-- Observation masking (efficient token reduction)
+- LLM-based compaction (model summarizes older messages)
 - Model-aware compression triggers
 """
 
+from salesbench.context.anchored_state import (
+    AnchoredState,
+    DecisionRecord,
+    LeadSummary,
+)
 from salesbench.context.buffers import (
-    KeyEventBuffer,
+    LLMCompactBuffer,
     Message,
     MessageBuffer,
-    SimpleCompactBuffer,
-    SlidingWindowBuffer,
+)
+from salesbench.context.compaction import (
+    BUYER_COMPACTION_PROMPT,
+    SELLER_COMPACTION_PROMPT,
+    create_buyer_compaction_fn,
+    create_seller_compaction_fn,
 )
 from salesbench.context.episode import (
-    AnchoredState,
     BuyerContextManager,
-    DecisionRecord,
     EpisodeContext,
     LeadConversation,
-    LeadSummary,
     SellerContextManager,
 )
 
@@ -35,7 +41,10 @@ __all__ = [
     # Buffers
     "Message",
     "MessageBuffer",
-    "SlidingWindowBuffer",
-    "KeyEventBuffer",
-    "SimpleCompactBuffer",
+    "LLMCompactBuffer",
+    # Compaction
+    "SELLER_COMPACTION_PROMPT",
+    "BUYER_COMPACTION_PROMPT",
+    "create_seller_compaction_fn",
+    "create_buyer_compaction_fn",
 ]

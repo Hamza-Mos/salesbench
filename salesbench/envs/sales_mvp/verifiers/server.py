@@ -154,7 +154,7 @@ def verify_episode(
     env = load_environment(
         seed=seed,
         num_leads=env_config.get("num_leads", 100),
-        total_days=env_config.get("total_days", 10),
+        total_hours=env_config.get("total_hours", 80),
     )
 
     # Replay trajectory
@@ -194,9 +194,9 @@ def verify_episode(
         final_result = env.orchestrator.get_final_result()
         state = env.orchestrator.env.state
 
-        from salesbench.envs.sales_mvp.verifiers.scoring import calculate_episode_score
+        from salesbench.envs.sales_mvp.verifiers.scoring import calculate_episode_revenue
 
-        score_components = calculate_episode_score(state)
+        revenue_metrics = calculate_episode_revenue(state)
 
         metrics = {
             "total_turns": final_result.total_turns,
@@ -209,9 +209,9 @@ def verify_episode(
         return {
             "episode_id": episode_id,
             "valid": True,
-            "score": score_components.total_score,
-            "passed": score_components.num_accepts > 0,
-            "components": score_components.to_dict()["components"],
+            "score": revenue_metrics.total_revenue,
+            "passed": revenue_metrics.num_accepts > 0,
+            "revenue_metrics": revenue_metrics.to_dict(),
             "metrics": metrics,
             "error": None,
         }
