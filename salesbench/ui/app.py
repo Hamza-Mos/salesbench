@@ -148,7 +148,11 @@ def create_leaderboard(
         data = writer.get_leaderboard_data()
         choices = []
         for r in data:
-            label = f"{r.get('model', 'unknown')} - {r.get('benchmark_id', 'unknown')[:12]} ({r.get('timestamp', '')[:10]})"
+            # Format timestamp: "2024-01-20T14:30:45" -> "2024-01-20 14:30"
+            timestamp = r.get("timestamp", "")[:16].replace("T", " ")
+            model = r.get("model", "unknown")
+            episodes = r.get("episodes", 0)
+            label = f"[{timestamp}] {model} ({episodes} eps)"
             choices.append((label, r.get("benchmark_id", "")))
         return choices
 

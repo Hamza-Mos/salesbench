@@ -87,7 +87,9 @@ class CallingTools:
         """
         # Check for active call
         if self.state.active_call is not None:
-            logger.warning(f"[SELLER:calling.start_call] Failed - call already active: {self.state.active_call.call_id}")
+            logger.warning(
+                f"[SELLER:calling.start_call] Failed - call already active: {self.state.active_call.call_id}"
+            )
             return ToolResult(
                 call_id="error",
                 success=False,
@@ -110,7 +112,9 @@ class CallingTools:
         # Check lead status - only ACTIVE leads can be called
         if lead.status == LeadStatus.DNC or lead.on_dnc_list:
             self.state.stats.dnc_violations += 1
-            logger.error(f"[SELLER:calling.start_call] DNC VIOLATION - attempted to call {lead.name} (ID: {lead_id})")
+            logger.error(
+                f"[SELLER:calling.start_call] DNC VIOLATION - attempted to call {lead.name} (ID: {lead_id})"
+            )
             return ToolResult(
                 call_id="error",
                 success=False,
@@ -140,7 +144,9 @@ class CallingTools:
         # Advance time (configurable cost to connect)
         self.state.time.advance_minutes(self.budget.start_call_cost, self.budget)
 
-        logger.info(f"[SELLER:calling.start_call] Started call with {lead.name} (ID: {lead_id}, temp: {lead.temperature.value})")
+        logger.info(
+            f"[SELLER:calling.start_call] Started call with {lead.name} (ID: {lead_id}, temp: {lead.temperature.value})"
+        )
 
         return ToolResult(
             call_id="",
@@ -249,6 +255,14 @@ class CallingTools:
                 error=f"Lead not found: {session.lead_id}",
             )
 
+        # Check if lead is already converted (already accepted an offer)
+        if lead.status == LeadStatus.CONVERTED or lead.converted:
+            return ToolResult(
+                call_id="error",
+                success=False,
+                error=f"Lead {session.lead_id} already accepted an offer. Use calling.end_call to finalize the sale.",
+            )
+
         # Invoke buyer simulator (LLM required)
         if not self._buyer_simulator:
             return ToolResult(
@@ -330,12 +344,16 @@ class CallingTools:
         if buyer_response.decision == BuyerDecision.ACCEPT_PLAN:
             session.outcome = BuyerDecision.ACCEPT_PLAN
             self.state.record_call_outcome(BuyerDecision.ACCEPT_PLAN)
-            result_data["message"] = "Buyer ACCEPTED the plan! End the call with calling.end_call to finalize."
+            result_data["message"] = (
+                "Buyer ACCEPTED the plan! End the call with calling.end_call to finalize."
+            )
             # Mark lead converted (updates both status and legacy flag)
             lead.status = LeadStatus.CONVERTED
             lead.converted = True
             # NOTE: Call NOT auto-ended - seller must call end_call themselves
-            logger.info(f"[BUYER:ACCEPT_PLAN] {lead.name} accepted offer: ${offer.monthly_premium}/mo for ${offer.coverage_amount} coverage")
+            logger.info(
+                f"[BUYER:ACCEPT_PLAN] {lead.name} accepted offer: ${offer.monthly_premium}/mo for ${offer.coverage_amount} coverage"
+            )
 
         elif buyer_response.decision == BuyerDecision.REJECT_PLAN:
             self.state.record_call_outcome(BuyerDecision.REJECT_PLAN)
@@ -359,7 +377,9 @@ class CallingTools:
             )
             result_data["rejection_count"] = lead.rejection_count
             result_data["patience_remaining"] = f"{lead.hidden.patience:.0%}"
-            logger.info(f"[BUYER:REJECT_PLAN] {lead.name} rejected offer ({lead.rejection_count} rejections)")
+            logger.info(
+                f"[BUYER:REJECT_PLAN] {lead.name} rejected offer ({lead.rejection_count} rejections)"
+            )
 
         elif buyer_response.decision == BuyerDecision.END_CALL:
             session.outcome = BuyerDecision.END_CALL
@@ -377,7 +397,9 @@ class CallingTools:
             lead.on_dnc_list = True
             result_data["dnc_requested"] = True
             result_data["message"] += " Lead requested Do Not Call."
-            logger.info(f"[BUYER:REQUEST_DNC] {lead.name} requested Do Not Call - added to DNC list")
+            logger.info(
+                f"[BUYER:REQUEST_DNC] {lead.name} requested Do Not Call - added to DNC list"
+            )
 
         # Add patience warning when patience is running low
         if lead.hidden.patience <= 0.20:
@@ -412,7 +434,9 @@ class CallingTools:
 
         self._finalize_call(session)
 
-        logger.info(f"[SELLER:calling.end_call] Ended call with {lead_name} (duration: {session.duration_minutes}min, offers: {len(session.offers_presented)})")
+        logger.info(
+            f"[SELLER:calling.end_call] Ended call with {lead_name} (duration: {session.duration_minutes}min, offers: {len(session.offers_presented)})"
+        )
 
         return ToolResult(
             call_id="",
@@ -435,7 +459,6 @@ class CallingTools:
         self.state.stats.total_call_minutes += session.duration_minutes
         self.state.call_history.append(session)
         self.state.active_call = None
-
 
     def get_buyer_conversational_response(self, seller_message: str) -> Optional[str]:
         """Get a conversational response from the buyer (not a decision).
