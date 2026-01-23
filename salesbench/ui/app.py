@@ -10,6 +10,7 @@ Or deploy to HuggingFace Spaces by pushing this file along with
 requirements.txt containing 'gradio>=4.0.0'.
 """
 
+import json
 import os
 from pathlib import Path
 from typing import Optional
@@ -20,6 +21,74 @@ except ImportError:
     raise ImportError("Gradio is required for the UI. Install with: pip install 'salesbench[ui]'")
 
 from salesbench.storage.json_writer import JSONResultsWriter
+
+# ============================================================================
+# Trace Formatting Helpers
+# ============================================================================
+
+
+def format_tool_call(tool_call: dict) -> str:
+    """Format a tool call for display."""
+    name = tool_call.get("tool_name", tool_call.get("name", "unknown"))
+    args = tool_call.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            pass
+    args_str = json.dumps(args, indent=2) if isinstance(args, dict) else str(args)
+    return f"**{name}**\n```json\n{args_str}\n```"
+
+
+def format_tool_result(result: dict) -> str:
+    """Format a tool result for display."""
+    success = result.get("success", True)
+    icon = "✅" if success else "❌"
+    output = result.get("data", result.get("output", result.get("result", "")))
+    if isinstance(output, dict):
+        output = json.dumps(output, indent=2)
+    # Truncate long outputs
+    if len(str(output)) > 500:
+        output = str(output)[:500] + "..."
+    return f"{icon} **Result:**\n```\n{output}\n```"
+
+
+def format_turn_markdown(turn: dict, turn_number: int) -> str:
+    """Format a complete turn for display."""
+    parts = [f"## Turn {turn_number}"]
+
+    # Seller message
+    seller_msg = turn.get("seller_message", turn.get("agent_message", ""))
+    if seller_msg:
+        parts.append("### Seller Message")
+        parts.append(f"> {seller_msg.replace(chr(10), chr(10) + '> ')}")
+
+    # Tool calls
+    tool_calls = turn.get("tool_calls", [])
+    if tool_calls:
+        parts.append("### Tool Calls")
+        for tc in tool_calls:
+            parts.append(format_tool_call(tc))
+
+    # Tool results
+    tool_results = turn.get("tool_results", [])
+    if tool_results:
+        parts.append("### Tool Results")
+        for tr in tool_results:
+            parts.append(format_tool_result(tr))
+
+    # Buyer response
+    buyer_msg = turn.get("buyer_response", turn.get("environment_response", ""))
+    if buyer_msg:
+        parts.append("### Buyer Response")
+        parts.append(f"> {buyer_msg.replace(chr(10), chr(10) + '> ')}")
+
+    # Score
+    score = turn.get("score", 0)
+    if score != 0:
+        parts.append(f"### Score: **{score}**")
+
+    return "\n\n".join(parts)
 
 
 def create_leaderboard(
@@ -106,8 +175,12 @@ def create_leaderboard(
 
         # Costs
         total_cost = cost_breakdown.get("total_cost", 0)
-        seller_cost = cost_breakdown.get("seller_input_cost", 0) + cost_breakdown.get("seller_output_cost", 0)
-        buyer_cost = cost_breakdown.get("buyer_input_cost", 0) + cost_breakdown.get("buyer_output_cost", 0)
+        seller_cost = cost_breakdown.get("seller_input_cost", 0) + cost_breakdown.get(
+            "seller_output_cost", 0
+        )
+        buyer_cost = cost_breakdown.get("buyer_input_cost", 0) + cost_breakdown.get(
+            "buyer_output_cost", 0
+        )
 
         # Time metrics
         action_minutes = aggregate.get("mean_action_based_minutes", 0)
@@ -130,10 +203,15 @@ def create_leaderboard(
 | Metric | Value |
 |--------|-------|
 | Mean Score | {aggregate.get('mean_score', 0):.2f} (±{aggregate.get('std_score', 0):.2f}) |
+| Score Range | {aggregate.get('min_score', 0):.1f} - {aggregate.get('max_score', 0):.1f} |
+| Median Score | {aggregate.get('median_score', 0):.2f} |
 | Acceptance Rate | {aggregate.get('mean_acceptance_rate', 0):.1%} |
 | Conversion Rate | {aggregate.get('conversion_rate', 0):.1%} |
 | Mean Calls | {aggregate.get('mean_calls', 0):.1f} |
 | Mean Offers | {aggregate.get('mean_offers', 0):.1f} |
+| Total Accepts | {aggregate.get('total_accepts', 0)} |
+| Episodes with Accepts | {aggregate.get('episodes_with_accepts', 0)}/{aggregate.get('n_episodes', 0)} |
+| Buyer Ended Calls | {aggregate.get('total_end_calls', 0)} |
 | Episode Success Rate | {aggregate.get('episode_success_rate', 0):.1%} |
 | DNC Violations | {aggregate.get('total_dnc_violations', 0)} |
 
@@ -143,6 +221,7 @@ def create_leaderboard(
 | Action-Based Minutes | {action_minutes:.1f} |
 | Token-Based Minutes | {token_minutes:.1f} |
 | Conversation Turns | {conversation_turns:.1f} |
+| Mean Episode Duration | {aggregate.get('mean_episode_duration', 0):.1f}s |
 | Wall-Clock Duration | {result.get('duration_seconds', 0):.1f}s |
 
 ### Token Usage (All Episodes)
@@ -183,10 +262,10 @@ def create_leaderboard(
 
             # Calculate totals
             total_tokens = (
-                token_usage.get("seller_input_tokens", 0) +
-                token_usage.get("seller_output_tokens", 0) +
-                token_usage.get("buyer_input_tokens", 0) +
-                token_usage.get("buyer_output_tokens", 0)
+                token_usage.get("seller_input_tokens", 0)
+                + token_usage.get("seller_output_tokens", 0)
+                + token_usage.get("buyer_input_tokens", 0)
+                + token_usage.get("buyer_output_tokens", 0)
             )
             total_cost = cost_breakdown.get("total_cost", 0)
 
@@ -242,7 +321,18 @@ Benchmarking AI agents on sales conversations.
                         "Duration",
                         "Date",
                     ],
-                    datatype=["number", "str", "str", "str", "number", "number", "str", "str", "str", "str"],
+                    datatype=[
+                        "number",
+                        "str",
+                        "str",
+                        "str",
+                        "number",
+                        "number",
+                        "str",
+                        "str",
+                        "str",
+                        "str",
+                    ],
                     every=refresh_interval,
                     interactive=False,
                     elem_classes=["leaderboard-table"],
@@ -327,6 +417,212 @@ Benchmarking AI agents on sales conversations.
                     fn=refresh_choices,
                     inputs=[],
                     outputs=[run_dropdown],
+                )
+
+            with gr.Tab("Trace Viewer"):
+                gr.Markdown("### View Conversation Traces")
+                gr.Markdown(
+                    "*Traces are only available for benchmark runs executed with the `-v` (verbose) flag.*"
+                )
+
+                trace_run_dropdown = gr.Dropdown(
+                    choices=get_run_choices(),
+                    label="Select Benchmark Run",
+                    value=None,
+                    interactive=True,
+                )
+
+                trace_refresh_btn = gr.Button("Refresh Run List", size="sm")
+
+                traces_status = gr.Markdown("Select a benchmark run to check for traces.")
+
+                episode_dropdown = gr.Dropdown(
+                    choices=[],
+                    label="Select Episode",
+                    value=None,
+                    interactive=True,
+                    visible=False,
+                )
+
+                turn_slider = gr.Slider(
+                    minimum=1,
+                    maximum=1,
+                    step=1,
+                    value=1,
+                    label="Turn",
+                    visible=False,
+                )
+
+                with gr.Row(visible=False) as nav_row:
+                    prev_btn = gr.Button("Previous Turn", size="sm")
+                    next_btn = gr.Button("Next Turn", size="sm")
+
+                turn_display = gr.Markdown("")
+
+                # State to store current trajectory
+                current_trajectory = gr.State([])
+                current_traces = gr.State(None)
+
+                def check_traces_available(benchmark_id):
+                    """Check if traces exist and load episode list."""
+                    if not benchmark_id:
+                        return (
+                            "Select a benchmark run to check for traces.",
+                            gr.Dropdown(choices=[], visible=False),
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
+                            "",
+                            [],
+                            None,
+                        )
+
+                    has_traces = writer.has_traces(benchmark_id)
+                    if not has_traces:
+                        return (
+                            "**No traces available** for this run. Run benchmark with `-v` flag to generate traces.",
+                            gr.Dropdown(choices=[], visible=False),
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
+                            "",
+                            [],
+                            None,
+                        )
+
+                    traces_data = writer.load_traces(benchmark_id)
+                    if not traces_data:
+                        return (
+                            "**Error loading traces.**",
+                            gr.Dropdown(choices=[], visible=False),
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
+                            "",
+                            [],
+                            None,
+                        )
+
+                    episodes = traces_data.get("episodes", [])
+                    episode_choices = []
+                    for ep in episodes:
+                        idx = ep.get("episode_index", 0)
+                        seed = ep.get("seed", "")
+                        traj_len = len(ep.get("trajectory", []))
+                        label = f"Episode {idx + 1} (seed: {seed}, {traj_len} turns)"
+                        episode_choices.append((label, idx))
+
+                    return (
+                        f"**Traces available** - {len(episodes)} episodes",
+                        gr.Dropdown(choices=episode_choices, visible=True, value=None),
+                        gr.Slider(visible=False),
+                        gr.Row(visible=False),
+                        "",
+                        [],
+                        traces_data,
+                    )
+
+                def load_episode_trajectory(episode_index, traces_data):
+                    """Load trajectory for selected episode."""
+                    if traces_data is None or episode_index is None:
+                        return (
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
+                            "",
+                            [],
+                        )
+
+                    episodes = traces_data.get("episodes", [])
+                    trajectory = []
+                    for ep in episodes:
+                        if ep.get("episode_index") == episode_index:
+                            trajectory = ep.get("trajectory", [])
+                            break
+
+                    if not trajectory:
+                        return (
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
+                            "No turns in this episode.",
+                            [],
+                        )
+
+                    max_turns = len(trajectory)
+                    first_turn_display = format_turn_markdown(trajectory[0], 1)
+
+                    return (
+                        gr.Slider(minimum=1, maximum=max_turns, value=1, visible=True),
+                        gr.Row(visible=True),
+                        first_turn_display,
+                        trajectory,
+                    )
+
+                def display_turn(turn_number, trajectory):
+                    """Display a specific turn."""
+                    if not trajectory or turn_number < 1:
+                        return ""
+                    idx = int(turn_number) - 1
+                    if idx >= len(trajectory):
+                        idx = len(trajectory) - 1
+                    return format_turn_markdown(trajectory[idx], idx + 1)
+
+                def prev_turn(current, trajectory):
+                    """Navigate to previous turn."""
+                    if not trajectory:
+                        return 1, ""
+                    new_turn = max(1, int(current) - 1)
+                    return new_turn, display_turn(new_turn, trajectory)
+
+                def next_turn(current, trajectory):
+                    """Navigate to next turn."""
+                    if not trajectory:
+                        return 1, ""
+                    new_turn = min(len(trajectory), int(current) + 1)
+                    return new_turn, display_turn(new_turn, trajectory)
+
+                def refresh_trace_choices():
+                    return gr.Dropdown(choices=get_run_choices())
+
+                # Event wiring
+                trace_run_dropdown.change(
+                    fn=check_traces_available,
+                    inputs=[trace_run_dropdown],
+                    outputs=[
+                        traces_status,
+                        episode_dropdown,
+                        turn_slider,
+                        nav_row,
+                        turn_display,
+                        current_trajectory,
+                        current_traces,
+                    ],
+                )
+
+                episode_dropdown.change(
+                    fn=load_episode_trajectory,
+                    inputs=[episode_dropdown, current_traces],
+                    outputs=[turn_slider, nav_row, turn_display, current_trajectory],
+                )
+
+                turn_slider.change(
+                    fn=display_turn,
+                    inputs=[turn_slider, current_trajectory],
+                    outputs=[turn_display],
+                )
+
+                prev_btn.click(
+                    fn=prev_turn,
+                    inputs=[turn_slider, current_trajectory],
+                    outputs=[turn_slider, turn_display],
+                )
+
+                next_btn.click(
+                    fn=next_turn,
+                    inputs=[turn_slider, current_trajectory],
+                    outputs=[turn_slider, turn_display],
+                )
+
+                trace_refresh_btn.click(
+                    fn=refresh_trace_choices,
+                    inputs=[],
+                    outputs=[trace_run_dropdown],
                 )
 
             with gr.Tab("How to Submit"):

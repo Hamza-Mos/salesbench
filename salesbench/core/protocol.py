@@ -170,40 +170,80 @@ def get_tool_schema(tool_name: str) -> dict[str, Any]:
     schemas = {
         "crm.search_leads": {
             "type": "object",
+            "description": "Search for leads matching criteria. Returns up to `limit` leads.",
             "properties": {
                 "temperature": {
                     "type": "string",
                     "enum": ["hot", "warm", "lukewarm", "cold", "hostile"],
+                    "description": "Filter by lead temperature/readiness level.",
                 },
-                "min_income": {"type": "number"},
-                "max_age": {"type": "integer"},
-                "limit": {"type": "integer", "default": 10},
+                "min_income": {
+                    "type": "number",
+                    "description": "Minimum annual income filter (e.g., 50000 for $50k+).",
+                },
+                "max_age": {
+                    "type": "integer",
+                    "description": "Maximum age filter.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 10,
+                    "description": "Maximum number of leads to return. Default: 10.",
+                },
             },
             "required": [],
         },
         "crm.get_lead": {
             "type": "object",
+            "description": "Get detailed information about a specific lead.",
             "properties": {
-                "lead_id": {"type": "string"},
+                "lead_id": {
+                    "type": "string",
+                    "description": "The lead ID (e.g., 'lead_abc123').",
+                },
             },
             "required": ["lead_id"],
         },
         "crm.update_lead": {
             "type": "object",
+            "description": "Update lead notes or temperature.",
             "properties": {
-                "lead_id": {"type": "string"},
-                "notes": {"type": "string"},
-                "temperature": {"type": "string"},
+                "lead_id": {
+                    "type": "string",
+                    "description": "The lead ID to update.",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Notes to add to the lead record.",
+                },
+                "temperature": {
+                    "type": "string",
+                    "enum": ["hot", "warm", "lukewarm", "cold", "hostile"],
+                    "description": "Update the lead's temperature/readiness level.",
+                },
             },
             "required": ["lead_id"],
         },
         "crm.log_call": {
             "type": "object",
+            "description": "Log a completed call for record-keeping.",
             "properties": {
-                "lead_id": {"type": "string"},
-                "call_id": {"type": "string"},
-                "outcome": {"type": "string"},
-                "notes": {"type": "string"},
+                "lead_id": {
+                    "type": "string",
+                    "description": "The lead that was called.",
+                },
+                "call_id": {
+                    "type": "string",
+                    "description": "The call ID from start_call.",
+                },
+                "outcome": {
+                    "type": "string",
+                    "description": "Call outcome (e.g., 'sale', 'rejected', 'no_answer', 'callback_scheduled').",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Additional notes about the call.",
+                },
             },
             "required": ["lead_id", "call_id", "outcome"],
         },
@@ -227,7 +267,10 @@ def get_tool_schema(tool_name: str) -> dict[str, Any]:
             "type": "object",
             "description": "Schedule a follow-up call with a lead.",
             "properties": {
-                "lead_id": {"type": "string"},
+                "lead_id": {
+                    "type": "string",
+                    "description": "The lead ID to schedule a call with.",
+                },
                 "hour": {
                     "type": "integer",
                     "minimum": 0,
@@ -238,8 +281,12 @@ def get_tool_schema(tool_name: str) -> dict[str, Any]:
         },
         "calling.start_call": {
             "type": "object",
+            "description": "Start a call with a lead. Must not already be in a call.",
             "properties": {
-                "lead_id": {"type": "string"},
+                "lead_id": {
+                    "type": "string",
+                    "description": "The lead ID to call (e.g., 'lead_abc123').",
+                },
             },
             "required": ["lead_id"],
         },
@@ -247,33 +294,58 @@ def get_tool_schema(tool_name: str) -> dict[str, Any]:
             "type": "object",
             "description": "Record a plan offer for analytics. This is purely analytical and does NOT send anything to the buyer. Use your message to actually pitch the plan.",
             "properties": {
-                "plan_id": {"type": "string", "enum": ["TERM", "WHOLE", "UL", "VUL", "LTC", "DI"]},
-                "monthly_premium": {"type": "number"},
-                "coverage_amount": {"type": "number"},
+                "plan_id": {
+                    "type": "string",
+                    "enum": ["TERM", "WHOLE", "UL", "VUL", "LTC", "DI"],
+                    "description": "The insurance plan type.",
+                },
+                "monthly_premium": {
+                    "type": "number",
+                    "description": "Monthly premium amount in dollars. Valid range: 1-10000.",
+                },
+                "coverage_amount": {
+                    "type": "number",
+                    "description": "Coverage amount in dollars. For DI, this is the monthly benefit (1000-15000).",
+                },
                 "next_step": {
                     "type": "string",
                     "enum": ["schedule_followup", "request_info", "close_now"],
+                    "description": "Proposed next step after the pitch.",
                 },
-                "term_years": {"type": "integer"},
+                "term_years": {
+                    "type": "integer",
+                    "enum": [10, 15, 20, 30],
+                    "description": "Term length for TERM plans only.",
+                },
             },
             "required": ["plan_id", "monthly_premium", "coverage_amount", "next_step"],
         },
         "calling.end_call": {
             "type": "object",
+            "description": "End the current call. Required after a sale or when done with the lead.",
             "properties": {
-                "reason": {"type": "string"},
+                "reason": {
+                    "type": "string",
+                    "description": "Reason for ending the call (e.g., 'sale_completed', 'rejected', 'callback_scheduled').",
+                },
             },
             "required": [],
         },
         "products.list_plans": {
             "type": "object",
+            "description": "List all available insurance plans with their details and coverage ranges.",
             "properties": {},
             "required": [],
         },
         "products.get_plan": {
             "type": "object",
+            "description": "Get detailed information about a specific insurance plan.",
             "properties": {
-                "plan_id": {"type": "string"},
+                "plan_id": {
+                    "type": "string",
+                    "enum": ["TERM", "WHOLE", "UL", "VUL", "LTC", "DI"],
+                    "description": "The plan ID to look up.",
+                },
             },
             "required": ["plan_id"],
         },
@@ -286,13 +358,23 @@ def get_tool_schema(tool_name: str) -> dict[str, Any]:
                     "enum": ["TERM", "WHOLE", "UL", "VUL", "LTC", "DI"],
                     "description": "The insurance plan type.",
                 },
-                "age": {"type": "integer", "description": "Age of the insured."},
+                "age": {
+                    "type": "integer",
+                    "description": (
+                        "Age of the insured. Valid ranges by plan: "
+                        "TERM/VUL: 18-75. WHOLE/UL: 18-80. LTC: 40-79. DI: 18-60."
+                    ),
+                },
                 "coverage_amount": {
                     "type": "number",
                     "description": (
-                        "For life insurance (TERM/WHOLE/UL/VUL): the death benefit in dollars (e.g., 500000 for $500k). "
-                        "For DI (disability): the MONTHLY benefit amount (e.g., 5000 for $5k/month). Valid range: 1000-15000. "
-                        "For LTC: the benefit pool amount."
+                        "Coverage amount in dollars. Ranges by plan type: "
+                        "TERM: 50000-5000000. "
+                        "WHOLE: 25000-10000000. "
+                        "UL: 50000-10000000. "
+                        "VUL: 100000-25000000. "
+                        "LTC: 50000-500000 (benefit pool). "
+                        "DI: 1000-15000 (MONTHLY benefit, not annual)."
                     ),
                 },
                 "risk_class": {

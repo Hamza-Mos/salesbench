@@ -185,10 +185,10 @@ class JSONResultsWriter:
 
                 # Calculate total tokens
                 total_tokens = (
-                    token_usage.get("seller_input_tokens", 0) +
-                    token_usage.get("seller_output_tokens", 0) +
-                    token_usage.get("buyer_input_tokens", 0) +
-                    token_usage.get("buyer_output_tokens", 0)
+                    token_usage.get("seller_input_tokens", 0)
+                    + token_usage.get("seller_output_tokens", 0)
+                    + token_usage.get("buyer_input_tokens", 0)
+                    + token_usage.get("buyer_output_tokens", 0)
                 )
 
                 results.append(
@@ -212,6 +212,7 @@ class JSONResultsWriter:
                         "mean_action_based_minutes": aggregate.get("mean_action_based_minutes", 0),
                         "mean_token_based_minutes": aggregate.get("mean_token_based_minutes", 0),
                         "mean_conversation_turns": aggregate.get("mean_conversation_turns", 0),
+                        "total_dnc_violations": aggregate.get("total_dnc_violations", 0),
                     }
                 )
             except Exception as e:
@@ -237,6 +238,61 @@ class JSONResultsWriter:
             except Exception:
                 continue
         return None
+
+    def _find_result_dir(self, benchmark_id: str) -> Optional[Path]:
+        """Find the result directory for a benchmark ID.
+
+        Args:
+            benchmark_id: The benchmark ID to search for.
+
+        Returns:
+            Path to the result directory, or None if not found.
+        """
+        for path in self.list_results():
+            try:
+                data = self.load_result(path)
+                if data.get("benchmark_id", "").startswith(benchmark_id):
+                    return path.parent
+            except Exception:
+                continue
+        return None
+
+    def has_traces(self, benchmark_id: str) -> bool:
+        """Check if traces.json exists for a benchmark.
+
+        Args:
+            benchmark_id: The benchmark ID to check.
+
+        Returns:
+            True if traces.json exists, False otherwise.
+        """
+        result_dir = self._find_result_dir(benchmark_id)
+        if result_dir is None:
+            return False
+        traces_path = result_dir / "traces.json"
+        return traces_path.exists()
+
+    def load_traces(self, benchmark_id: str) -> Optional[dict]:
+        """Load traces.json for a benchmark.
+
+        Args:
+            benchmark_id: The benchmark ID to load traces for.
+
+        Returns:
+            Parsed traces dictionary, or None if not found.
+        """
+        result_dir = self._find_result_dir(benchmark_id)
+        if result_dir is None:
+            return None
+        traces_path = result_dir / "traces.json"
+        if not traces_path.exists():
+            return None
+        try:
+            with open(traces_path) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load traces from {traces_path}: {e}")
+            return None
 
     def delete_result(self, path: Path) -> bool:
         """Delete a result file.

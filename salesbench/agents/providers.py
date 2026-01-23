@@ -177,6 +177,10 @@ class OpenAIProvider(ToolCallingProvider):
         raw_assistant_content: Optional[Any] = None,
     ) -> tuple[Optional[str], int, int]:
         """Re-prompt to get spoken message for propose_plan."""
+        # Defensive: handle None or empty tool_calls
+        if not tool_calls:
+            return None, 0, 0
+
         propose_call = next(
             (tc for tc in tool_calls if tc.tool_name == "calling.propose_plan"), None
         )
@@ -306,6 +310,10 @@ class AnthropicProvider(ToolCallingProvider):
         raw_assistant_content: Optional[Any] = None,
     ) -> tuple[Optional[str], int, int]:
         """Re-prompt to get spoken message for propose_plan."""
+        # Defensive: handle None or empty tool_calls
+        if not tool_calls:
+            return None, 0, 0
+
         propose_call = next(
             (tc for tc in tool_calls if tc.tool_name == "calling.propose_plan"), None
         )
@@ -565,8 +573,12 @@ class GoogleProvider(ToolCallingProvider):
             if finish_reason_name not in ("STOP", "MAX_TOKENS"):
                 logger.warning(f"[GEMINI] Non-standard finish_reason: {finish_reason_name}")
 
-                # For SAFETY/RECITATION, content is typically empty - retry once
-                if finish_reason_name in ("SAFETY", "RECITATION") and attempt < MAX_RETRIES:
+                # For transient errors, retry - content is typically empty or unusable
+                if (
+                    finish_reason_name
+                    in ("SAFETY", "RECITATION", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
+                    and attempt < MAX_RETRIES
+                ):
                     # Log safety ratings for debugging
                     safety_ratings = getattr(candidate, "safety_ratings", [])
                     for rating in safety_ratings:
@@ -574,8 +586,18 @@ class GoogleProvider(ToolCallingProvider):
                             logger.warning(
                                 f"[GEMINI] Blocked by {getattr(rating, 'category', 'unknown')}: {getattr(rating, 'probability', 'unknown')}"
                             )
-                    logger.info(f"[GEMINI] Retrying due to safety filter (attempt {attempt + 1})")
+                    logger.info(
+                        f"[GEMINI] Retrying due to {finish_reason_name} (attempt {attempt + 1})"
+                    )
                     continue
+
+                # For MALFORMED_FUNCTION_CALL after exhausting retries, return empty results
+                # to avoid parsing a malformed response that could cause iteration errors
+                if finish_reason_name == "MALFORMED_FUNCTION_CALL":
+                    logger.warning(
+                        f"[GEMINI] MALFORMED_FUNCTION_CALL after {MAX_RETRIES + 1} attempts, returning empty"
+                    )
+                    return None, [], input_tokens, output_tokens, None
 
             # Response looks valid, break out of retry loop
             break
@@ -586,29 +608,46 @@ class GoogleProvider(ToolCallingProvider):
 
         # Preserve raw Gemini content for thought_signature (Gemini 3 requirement)
         raw_gemini_content = None
-        if response and response.candidates and response.candidates[0].content:
-            raw_gemini_content = response.candidates[0].content
-            if raw_gemini_content.parts:
-                for part in raw_gemini_content.parts:
-                    # Check for text content
-                    if hasattr(part, "text") and part.text:
-                        text_content = part.text
-                    # Check for function call
-                    if hasattr(part, "function_call") and part.function_call:
-                        fc = part.function_call
-                        # Convert args to dict
-                        args = {}
-                        if fc.args:
-                            args = dict(fc.args) if hasattr(fc.args, "items") else fc.args
-                        # Convert string args back to integers based on original schema
-                        args = self._convert_string_args_to_int(args, tools, fc.name)
-                        tool_calls.append(
-                            ToolCall(
-                                tool_name=_from_api_name(fc.name),
-                                arguments=args,
-                                call_id=f"gemini_{fc.name}_{len(tool_calls)}",
+        try:
+            if response and response.candidates and response.candidates[0].content:
+                raw_gemini_content = response.candidates[0].content
+                parts = getattr(raw_gemini_content, "parts", None)
+                if parts:
+                    for part in parts:
+                        # Check for text content
+                        if hasattr(part, "text") and part.text:
+                            text_content = part.text
+                        # Check for function call
+                        if hasattr(part, "function_call") and part.function_call:
+                            fc = part.function_call
+                            # Convert args to dict (defensive: handle various formats)
+                            args = {}
+                            fc_args = getattr(fc, "args", None)
+                            if fc_args:
+                                try:
+                                    if hasattr(fc_args, "items"):
+                                        args = dict(fc_args)
+                                    elif isinstance(fc_args, dict):
+                                        args = fc_args
+                                    else:
+                                        # Try to convert if it's some other iterable
+                                        args = dict(fc_args)
+                                except (TypeError, ValueError) as e:
+                                    logger.warning(f"[GEMINI] Failed to parse function args: {e}")
+                                    args = {}
+                            # Convert string args back to integers based on original schema
+                            fc_name = getattr(fc, "name", "unknown")
+                            args = self._convert_string_args_to_int(args, tools, fc_name)
+                            tool_calls.append(
+                                ToolCall(
+                                    tool_name=_from_api_name(fc_name),
+                                    arguments=args,
+                                    call_id=f"gemini_{fc_name}_{len(tool_calls)}",
+                                )
                             )
-                        )
+        except Exception as e:
+            logger.warning(f"[GEMINI] Error parsing response: {e}")
+            # Return what we have so far (defensive)
 
         # Log detailed info when response is empty
         if not text_content and not tool_calls:
@@ -637,6 +676,11 @@ class GoogleProvider(ToolCallingProvider):
         from google.genai.types import AutomaticFunctionCallingConfig
 
         logger.info("[GEMINI REPROMPT] Called for propose_plan without message")
+
+        # Defensive: handle None or empty tool_calls
+        if not tool_calls:
+            logger.info("[GEMINI REPROMPT] No tool_calls provided")
+            return None, 0, 0
 
         propose_call = next(
             (tc for tc in tool_calls if tc.tool_name == "calling.propose_plan"), None
@@ -692,11 +736,19 @@ class GoogleProvider(ToolCallingProvider):
             types.Content(role="user", parts=[types.Part.from_text(text=reprompt_message)])
         )
 
+        # Explicitly disable function calling during reprompt
+        # This prevents UNEXPECTED_TOOL_CALL when Gemini tries to make tool calls
+        # based on conversation history even though no tools are passed
+        tool_config = types.ToolConfig(
+            function_calling_config=types.FunctionCallingConfig(mode="NONE")
+        )
+
         # Configure safety settings to be more permissive for sales content
         config = types.GenerateContentConfig(
             temperature=temperature,
             max_output_tokens=4096,  # High enough for any model including thinking models
             system_instruction=system_prompt,
+            tool_config=tool_config,
             # Disable AFC even though we have no tools - SDK may still log warnings
             automatic_function_calling=AutomaticFunctionCallingConfig(disable=True),
             safety_settings=[
@@ -749,6 +801,14 @@ class GoogleProvider(ToolCallingProvider):
                             f"[GEMINI REPROMPT] Got text on attempt {attempt + 1}: {part.text.strip()[:100]}..."
                         )
                         return part.text.strip(), total_in_tokens, total_out_tokens
+
+                # Log if model returned function calls despite tool_config mode=NONE
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, "function_call") and part.function_call:
+                        logger.warning(
+                            "[GEMINI REPROMPT] Model returned function call during reprompt (ignoring)"
+                        )
+                        break
 
             # Log why we're retrying
             finish_reason = None

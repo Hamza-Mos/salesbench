@@ -192,6 +192,10 @@ def _postprocess_tool_calls(tool_calls: list[ToolCall]) -> list[ToolCall]:
     We keep the first occurrence (stable) and drop duplicates. Additionally, we allow
     at most one `calling.propose_plan` and one `calling.end_call` per action.
     """
+    # Defensive: handle None or non-list inputs
+    if not tool_calls:
+        return []
+
     seen: set[tuple[str, str]] = set()
     filtered: list[ToolCall] = []
     propose_plan_seen = False
@@ -226,6 +230,8 @@ def _postprocess_tool_calls(tool_calls: list[ToolCall]) -> list[ToolCall]:
 
 def _has_propose_plan(tool_calls: list[ToolCall]) -> bool:
     """Check if any tool call is calling.propose_plan."""
+    if not tool_calls:
+        return False
     return any(tc.tool_name == "calling.propose_plan" for tc in tool_calls)
 
 
