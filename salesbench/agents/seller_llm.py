@@ -338,15 +338,13 @@ class LLMSellerAgent(SellerAgent):
         # Build user message from observation
         user_message = self._build_user_message(observation, episode_context)
 
-        # Get LLM response (returns message and tool_calls)
-        message, tool_calls = self._call_llm(user_message, episode_context)
+        # Get LLM response (returns message, tool_calls, and raw_llm_content)
+        message, tool_calls, raw_llm_content = self._call_llm(user_message, episode_context)
 
         self._turn_count += 1
-        return SellerAction(tool_calls=tool_calls, message=message)
+        return SellerAction(tool_calls=tool_calls, message=message, raw_llm_content=raw_llm_content)
 
-    def _build_user_message(
-        self, obs: SellerObservation, episode_context: "EpisodeContext"
-    ) -> str:
+    def _build_user_message(self, obs: SellerObservation, episode_context: "EpisodeContext") -> str:
         """Build user message from observation.
 
         Shows facts only - no directive language. The model decides based on context.
@@ -363,19 +361,23 @@ class LLMSellerAgent(SellerAgent):
         ]
 
         if obs.in_call:
-            lines.extend([
-                "",
-                f"## In Call: {obs.current_lead_id}",
-                f"- Duration: {obs.call_duration} minutes",
-                f"- Offers made this call: {obs.offers_this_call}",
-            ])
+            lines.extend(
+                [
+                    "",
+                    f"## In Call: {obs.current_lead_id}",
+                    f"- Duration: {obs.call_duration} minutes",
+                    f"- Offers made this call: {obs.offers_this_call}",
+                ]
+            )
 
         # Show tool results (just facts, no tracking updates - that's handled by AnchoredState)
         if obs.last_tool_results:
-            lines.extend([
-                "",
-                "## Last Tool Results",
-            ])
+            lines.extend(
+                [
+                    "",
+                    "## Last Tool Results",
+                ]
+            )
             for result in obs.last_tool_results:
                 if result.success:
                     data_str = json.dumps(result.data, default=str)
@@ -386,11 +388,13 @@ class LLMSellerAgent(SellerAgent):
                     lines.append(f"✗ {result.call_id}: {result.error}")
 
         if obs.message:
-            lines.extend([
-                "",
-                "## System Message",
-                obs.message,
-            ])
+            lines.extend(
+                [
+                    "",
+                    "## System Message",
+                    obs.message,
+                ]
+            )
 
         # Current status section - get uncalled leads from AnchoredState (single source of truth)
         lines.append("")
@@ -410,7 +414,7 @@ class LLMSellerAgent(SellerAgent):
         self,
         user_message: str,
         episode_context: "EpisodeContext",
-    ) -> tuple[Optional[str], list[ToolCall]]:
+    ) -> tuple[Optional[str], list[ToolCall], Optional[object]]:
         """Call LLM API with function calling.
 
         Args:
@@ -418,8 +422,9 @@ class LLMSellerAgent(SellerAgent):
             episode_context: Episode context for conversation history (required).
 
         Returns:
-            Tuple of (message, tool_calls) where message is optional free-form text
-            and tool_calls is a list of tool calls.
+            Tuple of (message, tool_calls, raw_llm_content) where message is optional
+            free-form text, tool_calls is a list of tool calls, and raw_llm_content
+            is provider-specific data (e.g., Gemini Content with thought_signature).
         """
         client = self._get_client()
         provider_impl = self._get_provider_impl()
@@ -436,11 +441,13 @@ class LLMSellerAgent(SellerAgent):
         messages.append({"role": "user", "content": user_message})
 
         # Use provider abstraction for the call
-        text_content, tool_calls, in_tokens, out_tokens = provider_impl.call_with_tools(
-            messages=messages,
-            tools=TOOLS_FOR_LLM,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
+        text_content, tool_calls, in_tokens, out_tokens, raw_llm_content = (
+            provider_impl.call_with_tools(
+                messages=messages,
+                tools=TOOLS_FOR_LLM,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+            )
         )
 
         # Track cost
@@ -448,24 +455,30 @@ class LLMSellerAgent(SellerAgent):
 
         # If no output at all, use fallback
         if not tool_calls and not text_content:
-            return None, self._fallback_action()
+            return None, self._fallback_action(), None
 
         # Post-process tool calls
         filtered_tool_calls = _postprocess_tool_calls(tool_calls)
 
         # GUARDRAIL: If propose_plan without message, re-prompt once
         if _has_propose_plan(filtered_tool_calls) and not (text_content and text_content.strip()):
+            logger.info("[SELLER] Triggering reprompt for propose_plan without message")
+            # Pass raw_llm_content so Gemini 3 can see the assistant's response with thought_signature
             reprompt_text, reprompt_in, reprompt_out = provider_impl.reprompt_for_message(
                 messages,
                 filtered_tool_calls,
                 SELLER_SYSTEM_PROMPT,
                 self.config.temperature,
+                raw_assistant_content=raw_llm_content,
             )
             self._track_cost(reprompt_in, reprompt_out, client.get_model_name())
             if reprompt_text:
+                logger.info(f"[SELLER] Reprompt succeeded, got: {reprompt_text[:100]}...")
                 text_content = reprompt_text
+            else:
+                logger.warning("[SELLER] Reprompt returned no text")
 
-        return text_content, filtered_tool_calls
+        return text_content, filtered_tool_calls, raw_llm_content
 
     def _fallback_action(self) -> list[ToolCall]:
         """Raise error when LLM returns nothing - no silent fallbacks."""

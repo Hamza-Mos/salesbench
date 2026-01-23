@@ -30,6 +30,9 @@ class Message:
             result["name"] = self.name
         if self.tool_call_id:
             result["tool_call_id"] = self.tool_call_id
+        # Include gemini_content for thought_signature preservation (Gemini 3 requirement)
+        if "gemini_content" in self.metadata:
+            result["gemini_content"] = self.metadata["gemini_content"]
         return result
 
     def token_estimate(self) -> int:

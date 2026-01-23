@@ -250,10 +250,15 @@ class EpisodeExecutor:
             # Extract tool calls from action
             tool_calls = action.tool_calls if action else []
             seller_message = action.message if action else None
+            raw_llm_content = action.raw_llm_content if action else None
 
-            # Record seller's message to episode context if present
-            if seller_message:
-                orchestrator.record_seller_message(seller_message)
+            # Record seller's action to episode context
+            # IMPORTANT: Pass raw_llm_content for ALL turns (Gemini 3 thought_signature)
+            # Even tool-only turns need their thought_signature preserved for multi-turn
+            if seller_message or raw_llm_content:
+                orchestrator.record_seller_message(
+                    seller_message or "", raw_llm_content=raw_llm_content
+                )
 
             if not tool_calls and not seller_message:
                 if verbose_callback:
@@ -478,9 +483,7 @@ class EpisodeExecutor:
             leads_dnc=leads_dnc,
             leads_active=leads_active,
             in_call=env_state.active_call is not None,
-            current_lead_id=(
-                str(env_state.active_call.lead_id) if env_state.active_call else None
-            ),
+            current_lead_id=(str(env_state.active_call.lead_id) if env_state.active_call else None),
         )
 
 

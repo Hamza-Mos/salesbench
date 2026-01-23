@@ -84,7 +84,7 @@ class LLMClient(ABC):
         self,
         messages: list[dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 1000,
+        max_tokens: int = 16384,
         response_format: Optional[dict[str, str]] = None,
     ) -> LLMResponse:
         """Generate a completion.
@@ -137,7 +137,7 @@ class OpenAIClient(LLMClient):
         self,
         messages: list[dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 1000,
+        max_tokens: int = 16384,
         response_format: Optional[dict[str, str]] = None,
     ) -> LLMResponse:
         client = self._get_client()
@@ -203,7 +203,7 @@ class AnthropicClient(LLMClient):
         self,
         messages: list[dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 1000,
+        max_tokens: int = 16384,
         response_format: Optional[dict[str, str]] = None,
     ) -> LLMResponse:
         client = self._get_client()
@@ -281,7 +281,7 @@ class OpenRouterClient(LLMClient):
         self,
         messages: list[dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 1000,
+        max_tokens: int = 16384,
         response_format: Optional[dict[str, str]] = None,
     ) -> LLMResponse:
         client = self._get_client()
@@ -352,7 +352,7 @@ class XAIClient(LLMClient):
         self,
         messages: list[dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 1000,
+        max_tokens: int = 16384,
         response_format: Optional[dict[str, str]] = None,
     ) -> LLMResponse:
         client = self._get_client()
@@ -421,7 +421,7 @@ class TogetherClient(LLMClient):
         self,
         messages: list[dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 1000,
+        max_tokens: int = 16384,
         response_format: Optional[dict[str, str]] = None,
     ) -> LLMResponse:
         client = self._get_client()
@@ -497,7 +497,7 @@ class PrimeIntellectClient(LLMClient):
         self,
         messages: list[dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 1000,
+        max_tokens: int = 16384,
         response_format: Optional[dict[str, str]] = None,
     ) -> LLMResponse:
         client = self._get_client()
@@ -531,13 +531,13 @@ class PrimeIntellectClient(LLMClient):
 
 
 class GoogleClient(LLMClient):
-    """Google AI API client (Gemini)."""
+    """Google AI API client (Gemini) using the new google-genai SDK."""
 
     provider = LLMProvider.GOOGLE
 
     def __init__(
         self,
-        model: str = "gemini-1.5-flash",
+        model: str = "gemini-3-pro-preview",
         api_key: Optional[str] = None,
     ):
         self.model = model
@@ -550,13 +550,12 @@ class GoogleClient(LLMClient):
     def _get_client(self):
         if self._client is None:
             try:
-                import google.generativeai as genai
+                from google import genai
 
-                genai.configure(api_key=self._api_key)
-                self._client = genai.GenerativeModel(self.model)
+                self._client = genai.Client(api_key=self._api_key)
             except ImportError:
                 raise ImportError(
-                    "google-generativeai package required. Install: pip install google-generativeai"
+                    "google-genai package required. Install: pip install google-genai"
                 )
         return self._client
 
@@ -564,63 +563,87 @@ class GoogleClient(LLMClient):
         self,
         messages: list[dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 1000,
+        max_tokens: int = 16384,
         response_format: Optional[dict[str, str]] = None,
     ) -> LLMResponse:
         client = self._get_client()
 
-        # Convert messages to Gemini format
-        history = []
-        current_message = None
-
-        for msg in messages:
-            if msg["role"] == "system":
-                # Prepend system message to first user message
-                current_message = msg["content"] + "\n\n"
-            elif msg["role"] == "user":
-                content = (current_message or "") + msg["content"]
-                current_message = None
-                history.append({"role": "user", "parts": [content]})
-            elif msg["role"] == "assistant":
-                history.append({"role": "model", "parts": [msg["content"]]})
-
-        # Get the last user message as the prompt
-        if history and history[-1]["role"] == "user":
-            prompt = history[-1]["parts"][0]
-            chat_history = history[:-1]
-        else:
-            prompt = "Continue"
-            chat_history = history
-
         try:
-            import google.generativeai as genai
+            from google.genai import types
 
-            generation_config = genai.GenerationConfig(
-                temperature=temperature,
-                max_output_tokens=max_tokens,
-            )
+            # Convert messages to Gemini format
+            contents = []
+            system_instruction = None
+
+            for msg in messages:
+                if msg["role"] == "system":
+                    system_instruction = msg["content"]
+                elif msg["role"] == "user":
+                    contents.append(
+                        types.Content(
+                            role="user", parts=[types.Part.from_text(text=msg["content"])]
+                        )
+                    )
+                elif msg["role"] == "assistant":
+                    contents.append(
+                        types.Content(
+                            role="model", parts=[types.Part.from_text(text=msg["content"])]
+                        )
+                    )
+
+            # Build generation config
+            config_kwargs = {
+                "temperature": temperature,
+                "max_output_tokens": max_tokens,
+            }
 
             if response_format and response_format.get("type") == "json_object":
-                generation_config.response_mime_type = "application/json"
+                config_kwargs["response_mime_type"] = "application/json"
 
-            chat = client.start_chat(history=chat_history)
-            response = chat.send_message(prompt, generation_config=generation_config)
+            if system_instruction:
+                config_kwargs["system_instruction"] = system_instruction
+
+            config = types.GenerateContentConfig(**config_kwargs)
+
+            response = client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+
+            # Extract text from response
+            text = ""
+            if (
+                response.candidates
+                and response.candidates[0].content
+                and response.candidates[0].content.parts
+            ):
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, "text") and part.text:
+                        text = part.text
+                        break
+
+            # Extract usage metadata
+            usage_metadata = getattr(response, "usage_metadata", None)
+
+            # Extract actual finish_reason from response
+            finish_reason = "stop"
+            if response.candidates:
+                fr = getattr(response.candidates[0], "finish_reason", None)
+                if fr:
+                    # Convert enum to lowercase string (e.g., STOP -> stop, SAFETY -> safety)
+                    finish_reason_name = getattr(fr, "name", str(fr))
+                    finish_reason = finish_reason_name.lower().replace("finishreason.", "")
 
             return LLMResponse(
-                content=response.text,
+                content=text,
                 model=self.model,
                 usage={
-                    "prompt_tokens": response.usage_metadata.prompt_token_count
-                    if hasattr(response, "usage_metadata")
-                    else 0,
-                    "completion_tokens": response.usage_metadata.candidates_token_count
-                    if hasattr(response, "usage_metadata")
-                    else 0,
-                    "total_tokens": response.usage_metadata.total_token_count
-                    if hasattr(response, "usage_metadata")
-                    else 0,
+                    "prompt_tokens": getattr(usage_metadata, "prompt_token_count", 0) or 0,
+                    "completion_tokens": getattr(usage_metadata, "candidates_token_count", 0) or 0,
+                    "total_tokens": getattr(usage_metadata, "total_token_count", 0) or 0,
                 },
-                finish_reason="stop",
+                finish_reason=finish_reason,
                 provider="google",
             )
         except Exception as e:
@@ -643,7 +666,7 @@ class MockLLMClient(LLMClient):
         self,
         messages: list[dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 1000,
+        max_tokens: int = 16384,
         response_format: Optional[dict[str, str]] = None,
     ) -> LLMResponse:
         response_idx = self._call_count % len(self.responses)

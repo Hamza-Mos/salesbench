@@ -137,12 +137,8 @@ class Orchestrator:
         self._cumulative_score = 0.0
 
         # Get model configs for context management (use defaults if not provided)
-        seller_cfg = (
-            seller_model_spec.config if seller_model_spec else get_model_config("gpt-4o")
-        )
-        buyer_cfg = (
-            buyer_model_spec.config if buyer_model_spec else get_model_config("gpt-4o-mini")
-        )
+        seller_cfg = seller_model_spec.config if seller_model_spec else get_model_config("gpt-4o")
+        buyer_cfg = buyer_model_spec.config if buyer_model_spec else get_model_config("gpt-4o-mini")
 
         # Create compaction functions using same models as agents
         seller_compaction_fn = None
@@ -424,7 +420,9 @@ class Orchestrator:
         # End turn and get observation
         observation = self._env.end_turn()
         self._budget_tracker.reset_turn()
-        logger.debug(f"[TURN:{self._termination_checker.turn_count}] Turn ended - {self._env.state.time.elapsed_hours}h {int(self._env.state.time.elapsed_minutes):02d}m")
+        logger.debug(
+            f"[TURN:{self._termination_checker.turn_count}] Turn ended - {self._env.state.time.elapsed_hours}h {int(self._env.state.time.elapsed_minutes):02d}m"
+        )
 
         # --- Inject stall warning if threshold exceeded ---
         max_turns = self.config.budget.max_turns_without_tool_call
@@ -436,7 +434,9 @@ class Orchestrator:
                 "DO NOT: Ask more questions, explain again, or continue pitching.\n"
                 "The buyer is not ready. Move on to the next lead."
             )
-            logger.warning(f"[STALL] Turn {self._termination_checker.turn_count}: {self._turns_since_tool_call} turns without tool call")
+            logger.warning(
+                f"[STALL] Turn {self._termination_checker.turn_count}: {self._turns_since_tool_call} turns without tool call"
+            )
 
         # Update budget tracker with current time
         self._budget_tracker.record_time(
@@ -584,18 +584,30 @@ class Orchestrator:
         lead_id = data.get("lead_id") or self._episode_context.current_lead_id
         self._episode_context.record_tool_result(tool_name, data, lead_id=lead_id)
 
-    def record_seller_message(self, message: str) -> None:
+    def record_seller_message(
+        self,
+        message: str,
+        raw_llm_content: Optional[Any] = None,
+    ) -> None:
         """Record a seller's spoken message to the episode context.
 
         This should be called by the executor when the seller agent
         produces a message to be spoken to the buyer.
 
         Args:
-            message: The message the seller is speaking.
+            message: The message the seller is speaking (can be empty for tool-only turns).
+            raw_llm_content: Provider-specific content (e.g., Gemini Content with
+                            thought_signature) for multi-turn conversation preservation.
+                            IMPORTANT: Must be passed even for tool-only turns to
+                            preserve Gemini 3's mandatory thought_signature.
         """
+        # Only mark as spoken message if there's actual content
+        # Tool-only turns still need to record gemini_content for thought_signature
+        is_spoken = bool(message and message.strip())
         self._episode_context.record_seller_action(
-            content=message,
-            is_spoken_message=True,
+            content=message if is_spoken else "[tool calls only]",
+            is_spoken_message=is_spoken,
+            gemini_content=raw_llm_content,
         )
 
     def get_buyer_response(self, seller_message: str) -> Optional[str]:

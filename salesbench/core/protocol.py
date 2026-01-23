@@ -39,6 +39,8 @@ class SellerAction:
     Can contain:
     - message: Free-form text to send to the buyer (the actual conversation)
     - tool_calls: Analytical/operational tools (CRM, products, etc.)
+    - raw_llm_content: Provider-specific content for multi-turn preservation
+                       (e.g., Gemini Content with thought_signature)
 
     The seller can output both a message AND tool calls in the same turn.
     Tool calls like propose_plan are purely analytical and don't affect the conversation.
@@ -46,6 +48,7 @@ class SellerAction:
 
     tool_calls: list[ToolCall] = field(default_factory=list)
     message: Optional[str] = None
+    raw_llm_content: Optional[Any] = None  # Provider-specific (e.g., Gemini Content)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -55,6 +58,7 @@ class SellerAction:
         }
         if self.message:
             result["message"] = self.message
+        # raw_llm_content is intentionally not serialized - it's for in-memory use only
         return result
 
 
@@ -293,7 +297,13 @@ def get_tool_schema(tool_name: str) -> dict[str, Any]:
                 },
                 "risk_class": {
                     "type": "string",
-                    "enum": ["preferred_plus", "preferred", "standard_plus", "standard", "substandard"],
+                    "enum": [
+                        "preferred_plus",
+                        "preferred",
+                        "standard_plus",
+                        "standard",
+                        "substandard",
+                    ],
                     "description": "Risk classification. Default: standard_plus.",
                 },
                 "term_years": {

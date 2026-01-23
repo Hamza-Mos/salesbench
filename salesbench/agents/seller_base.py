@@ -13,6 +13,7 @@ from salesbench.core.protocol import SellerAction, validate_seller_action
 from salesbench.core.types import ToolCall, ToolResult
 from salesbench.models import get_model_config, is_supported_model
 
+
 @dataclass
 class SellerObservation:
     """Observation provided to the seller agent.
@@ -114,7 +115,7 @@ class SellerConfig:
     # Model settings (for LLM-based sellers)
     model: str = "gpt-4o"
     temperature: float = 0.7
-    max_tokens: int = 1000
+    max_tokens: int = 16384  # High default to avoid bottlenecking any model
 
     # Strategy settings
     max_offers_per_call: int = 3

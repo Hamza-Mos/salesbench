@@ -361,7 +361,7 @@ class LLMBuyerSimulator:
             RuntimeError: If LLM call fails.
         """
         # Get rejection count from persona (may be tracked by environment)
-        rejection_count = getattr(persona, 'rejection_count', 0)
+        rejection_count = getattr(persona, "rejection_count", 0)
         prompt = create_buyer_prompt(
             persona, offer, session, seller_pitch, negotiation_history, rejection_count
         )
@@ -374,7 +374,7 @@ class LLMBuyerSimulator:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=self.temperature,
-                max_tokens=250,
+                max_tokens=4096,  # High enough for any model
                 response_format={"type": "json_object"},
             )
 
@@ -435,7 +435,7 @@ class LLMBuyerSimulator:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=self.temperature,
-                max_tokens=150,
+                max_tokens=4096,  # High enough for any model
                 response_format={"type": "json_object"},
             )
 

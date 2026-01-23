@@ -16,7 +16,7 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -355,6 +355,7 @@ class EpisodeContext:
         content: str,
         tool_calls: Optional[list] = None,
         is_spoken_message: bool = False,
+        gemini_content: Optional[Any] = None,
     ) -> None:
         """Record seller's action (message and/or tool calls).
 
@@ -362,6 +363,8 @@ class EpisodeContext:
             content: The seller's message or action description.
             tool_calls: Optional list of tool calls made.
             is_spoken_message: True if this is a message the buyer hears.
+            gemini_content: Raw Gemini Content object for thought_signature preservation.
+                           Required for Gemini 3 multi-turn function calling.
         """
         self._message_counter += 1
 
@@ -381,11 +384,17 @@ class EpisodeContext:
 
         full_content = "\n".join(message_parts) if message_parts else "[No content]"
 
+        # Build metadata - include gemini_content if provided
+        metadata = {}
+        if gemini_content is not None:
+            metadata["gemini_content"] = gemini_content
+
         message = Message(
             role="assistant",
             content=full_content,
             priority=priority,
             timestamp=self._message_counter,
+            metadata=metadata,
         )
 
         # Add to seller manager
@@ -655,9 +664,7 @@ class EpisodeContext:
         messages = self._seller_manager.get_view()
         token_count = self._seller_manager.token_count()
 
-        logger.debug(
-            f"[Seller View] Retrieved {len(messages)} messages, ~{token_count:,} tokens"
-        )
+        logger.debug(f"[Seller View] Retrieved {len(messages)} messages, ~{token_count:,} tokens")
 
         # INJECT anchored state - always accurate, never lost to compaction
         anchored_block = self._anchored_state.to_context_block()

@@ -182,7 +182,9 @@ class BenchmarkConfig:
         # Build BudgetConfig from preset with optional overrides
         budget_preset = presets.get("budget", {})
         budget_config = BudgetConfig(
-            total_hours=total_hours if total_hours is not None else budget_preset.get("total_hours", 80),
+            total_hours=total_hours
+            if total_hours is not None
+            else budget_preset.get("total_hours", 80),
         )
 
         # Build episode config with seed, num_leads, and budget
@@ -223,7 +225,7 @@ class BenchmarkConfig:
         seller_model: Optional[str] = None,
         buyer_model: Optional[str] = None,
         domain: str = "insurance",
-        no_supabase: bool = False,
+        no_supabase: bool = True,
         enable_telemetry: bool = False,
         output: Optional[str] = None,
         verbose: bool = False,
