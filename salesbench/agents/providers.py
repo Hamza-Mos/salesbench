@@ -772,7 +772,7 @@ class GoogleProvider(ToolCallingProvider):
         )
 
         # Retry loop for reprompt - Gemini can return empty responses
-        MAX_REPROMPT_RETRIES = 2
+        MAX_REPROMPT_RETRIES = 3
         total_in_tokens = 0
         total_out_tokens = 0
 

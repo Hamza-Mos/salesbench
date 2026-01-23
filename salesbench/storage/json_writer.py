@@ -294,6 +294,74 @@ class JSONResultsWriter:
             logger.warning(f"Failed to load traces from {traces_path}: {e}")
             return None
 
+    def load_episode_metadata(self, benchmark_id: str) -> Optional[list[dict]]:
+        """Load only episode metadata from traces.json (without full trajectories).
+
+        This is more memory-efficient for listing episodes in the UI.
+
+        Args:
+            benchmark_id: The benchmark ID to load metadata for.
+
+        Returns:
+            List of episode metadata dicts (episode_index, seed, turn_count), or None if not found.
+        """
+        result_dir = self._find_result_dir(benchmark_id)
+        if result_dir is None:
+            return None
+        traces_path = result_dir / "traces.json"
+        if not traces_path.exists():
+            return None
+        try:
+            with open(traces_path) as f:
+                data = json.load(f)
+
+            episodes = data.get("episodes", [])
+            metadata = []
+            for ep in episodes:
+                metadata.append(
+                    {
+                        "episode_index": ep.get("episode_index", 0),
+                        "seed": ep.get("seed", ""),
+                        "turn_count": len(ep.get("trajectory", [])),
+                    }
+                )
+            return metadata
+        except Exception as e:
+            logger.warning(f"Failed to load episode metadata from {traces_path}: {e}")
+            return None
+
+    def load_episode_trajectory(
+        self, benchmark_id: str, episode_index: int
+    ) -> Optional[list[dict]]:
+        """Load trajectory for a specific episode from traces.json.
+
+        This loads only the requested episode's trajectory, not the entire file.
+
+        Args:
+            benchmark_id: The benchmark ID to load from.
+            episode_index: The index of the episode to load.
+
+        Returns:
+            List of turn dicts for the episode, or None if not found.
+        """
+        result_dir = self._find_result_dir(benchmark_id)
+        if result_dir is None:
+            return None
+        traces_path = result_dir / "traces.json"
+        if not traces_path.exists():
+            return None
+        try:
+            with open(traces_path) as f:
+                data = json.load(f)
+
+            for ep in data.get("episodes", []):
+                if ep.get("episode_index") == episode_index:
+                    return ep.get("trajectory", [])
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to load episode trajectory from {traces_path}: {e}")
+            return None
+
     def delete_result(self, path: Path) -> bool:
         """Delete a result file.
 

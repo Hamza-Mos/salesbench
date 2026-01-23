@@ -21,7 +21,7 @@ from salesbench.context.compaction import (
 from salesbench.context.episode import EpisodeContext
 from salesbench.core.config import SalesBenchConfig
 from salesbench.core.errors import EpisodeTerminated
-from salesbench.core.types import ToolCall, ToolResult
+from salesbench.core.types import LeadStatus, ToolCall, ToolResult
 from salesbench.envs.sales_mvp.env import SalesEnv
 from salesbench.models import ModelSpec, get_model_config
 from salesbench.orchestrator.budgets import BudgetTracker
@@ -689,6 +689,14 @@ class Orchestrator:
         stats = self._env.state.stats
         usage = self._budget_tracker.usage
 
+        # Count leads by status
+        leads = self._env.state.leads
+        total_leads = len(leads)
+        leads_contacted = sum(1 for l in leads.values() if l.call_count > 0)
+        leads_converted = sum(1 for l in leads.values() if l.status == LeadStatus.CONVERTED)
+        leads_dnc = sum(1 for l in leads.values() if l.status == LeadStatus.DNC)
+        leads_uncontacted = total_leads - leads_contacted
+
         metrics = {
             "total_calls": stats.total_calls,
             "total_call_minutes": stats.total_call_minutes,
@@ -709,6 +717,12 @@ class Orchestrator:
             "time_model_used": self.config.budget.time_model,
             "budget_minutes_used": self._budget_tracker.get_budget_minutes(),
             "conversation_turns": usage.conversation_turns,
+            # Lead outcome metrics
+            "total_leads": total_leads,
+            "leads_contacted": leads_contacted,
+            "leads_converted": leads_converted,
+            "leads_dnc": leads_dnc,
+            "leads_uncontacted": leads_uncontacted,
         }
 
         return EpisodeResult(

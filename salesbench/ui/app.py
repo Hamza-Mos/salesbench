@@ -91,6 +91,21 @@ def format_turn_markdown(turn: dict, turn_number: int) -> str:
     return "\n\n".join(parts)
 
 
+def format_all_turns_markdown(trajectory: list[dict]) -> str:
+    """Format all turns in a trajectory for display in a scrollable view."""
+    if not trajectory:
+        return "No turns to display."
+
+    parts = [f"# Full Conversation ({len(trajectory)} turns)\n"]
+    parts.append("---\n")
+
+    for i, turn in enumerate(trajectory):
+        parts.append(format_turn_markdown(turn, i + 1))
+        parts.append("\n---\n")
+
+    return "\n".join(parts)
+
+
 def create_leaderboard(
     results_dir: Optional[str] = None,
     title: str = "SalesBench Leaderboard",
@@ -191,6 +206,14 @@ def create_leaderboard(
         token_minutes = aggregate.get("mean_token_based_minutes", 0)
         conversation_turns = aggregate.get("mean_conversation_turns", 0)
 
+        # Lead outcome metrics
+        total_leads = aggregate.get("total_leads", 0)
+        leads_contacted = aggregate.get("total_leads_contacted", 0)
+        leads_converted = aggregate.get("total_leads_converted", 0)
+        leads_dnc = aggregate.get("total_leads_dnc", 0)
+        leads_uncontacted = aggregate.get("total_leads_uncontacted", 0)
+        lead_contact_rate = aggregate.get("lead_contact_rate", 0)
+
         details = f"""## Benchmark: {result.get('benchmark_id', 'unknown')}
 
 ### Configuration
@@ -218,6 +241,15 @@ def create_leaderboard(
 | Buyer Ended Calls | {aggregate.get('total_end_calls', 0)} |
 | Episode Success Rate | {aggregate.get('episode_success_rate', 0):.1%} |
 | DNC Violations | {aggregate.get('total_dnc_violations', 0)} |
+
+### Lead Outcomes (All Episodes)
+| Metric | Value |
+|--------|-------|
+| Total Leads | {total_leads} |
+| Leads Contacted | {leads_contacted} ({lead_contact_rate:.1%}) |
+| Leads Converted | {leads_converted} |
+| Leads DNC | {leads_dnc} |
+| Leads Uncontacted | {leads_uncontacted} |
 
 ### Time Metrics
 | Metric | Value |
@@ -273,6 +305,12 @@ def create_leaderboard(
             )
             total_cost = cost_breakdown.get("total_cost", 0)
 
+            # Lead outcome stats (compact format: contacted/total)
+            total_leads = metrics.get("total_leads", 0)
+            leads_contacted = metrics.get("leads_contacted", 0)
+            leads_converted = metrics.get("leads_converted", 0)
+            leads_str = f"{leads_contacted}/{total_leads}" if total_leads > 0 else "N/A"
+
             rows.append(
                 [
                     ep.get("episode_index", 0) + 1,
@@ -282,6 +320,8 @@ def create_leaderboard(
                     metrics.get("rejected_offers", 0),
                     ep.get("dnc_violations", 0),
                     metrics.get("total_calls", 0),
+                    leads_str,
+                    leads_converted,
                     ep.get("total_turns", 0),
                     f"{metrics.get('action_based_minutes', 0):.0f}",
                     f"{total_tokens:,}" if total_tokens else "0",
@@ -378,6 +418,8 @@ Benchmarking AI agents on sales conversations.
                         "Rejects",
                         "DNC",
                         "Calls",
+                        "Leads",
+                        "Converted",
                         "Turns",
                         "Minutes",
                         "Tokens",
@@ -391,6 +433,8 @@ Benchmarking AI agents on sales conversations.
                         "number",
                         "number",
                         "number",
+                        "number",
+                        "str",
                         "number",
                         "number",
                         "str",
@@ -448,6 +492,13 @@ Benchmarking AI agents on sales conversations.
                     visible=False,
                 )
 
+                # Toggle for viewing all turns at once
+                show_all_turns = gr.Checkbox(
+                    label="Show all turns (scrollable view)",
+                    value=False,
+                    visible=False,
+                )
+
                 turn_slider = gr.Slider(
                     minimum=1,
                     maximum=1,
@@ -463,16 +514,17 @@ Benchmarking AI agents on sales conversations.
 
                 turn_display = gr.Markdown("")
 
-                # State to store current trajectory
+                # State to store current trajectory and benchmark ID
                 current_trajectory = gr.State([])
-                current_traces = gr.State(None)
+                current_benchmark_id = gr.State(None)
 
                 def check_traces_available(benchmark_id):
-                    """Check if traces exist and load episode list."""
+                    """Check if traces exist and load episode list (metadata only)."""
                     if not benchmark_id:
                         return (
                             "Select a benchmark run to check for traces.",
                             gr.Dropdown(choices=[], visible=False),
+                            gr.Checkbox(visible=False),
                             gr.Slider(visible=False),
                             gr.Row(visible=False),
                             "",
@@ -485,6 +537,7 @@ Benchmarking AI agents on sales conversations.
                         return (
                             "**No traces available** for this run. Run benchmark with `-v` flag to generate traces.",
                             gr.Dropdown(choices=[], visible=False),
+                            gr.Checkbox(visible=False),
                             gr.Slider(visible=False),
                             gr.Row(visible=False),
                             "",
@@ -492,11 +545,13 @@ Benchmarking AI agents on sales conversations.
                             None,
                         )
 
-                    traces_data = writer.load_traces(benchmark_id)
-                    if not traces_data:
+                    # Load only episode metadata, not full trajectories (memory efficient)
+                    episode_metadata = writer.load_episode_metadata(benchmark_id)
+                    if not episode_metadata:
                         return (
                             "**Error loading traces.**",
                             gr.Dropdown(choices=[], visible=False),
+                            gr.Checkbox(visible=False),
                             gr.Slider(visible=False),
                             gr.Row(visible=False),
                             "",
@@ -504,44 +559,42 @@ Benchmarking AI agents on sales conversations.
                             None,
                         )
 
-                    episodes = traces_data.get("episodes", [])
                     episode_choices = []
-                    for ep in episodes:
+                    for ep in episode_metadata:
                         idx = ep.get("episode_index", 0)
                         seed = ep.get("seed", "")
-                        traj_len = len(ep.get("trajectory", []))
-                        label = f"Episode {idx + 1} (seed: {seed}, {traj_len} turns)"
+                        turn_count = ep.get("turn_count", 0)
+                        label = f"Episode {idx + 1} (seed: {seed}, {turn_count} turns)"
                         episode_choices.append((label, idx))
 
                     return (
-                        f"**Traces available** - {len(episodes)} episodes",
+                        f"**Traces available** - {len(episode_metadata)} episodes",
                         gr.Dropdown(choices=episode_choices, visible=True, value=None),
+                        gr.Checkbox(visible=False, value=False),
                         gr.Slider(visible=False),
                         gr.Row(visible=False),
                         "",
                         [],
-                        traces_data,
+                        benchmark_id,
                     )
 
-                def load_episode_trajectory(episode_index, traces_data):
-                    """Load trajectory for selected episode."""
-                    if traces_data is None or episode_index is None:
+                def load_episode_trajectory(episode_index, benchmark_id, show_all):
+                    """Load trajectory for selected episode on-demand."""
+                    if benchmark_id is None or episode_index is None:
                         return (
+                            gr.Checkbox(visible=False),
                             gr.Slider(visible=False),
                             gr.Row(visible=False),
                             "",
                             [],
                         )
 
-                    episodes = traces_data.get("episodes", [])
-                    trajectory = []
-                    for ep in episodes:
-                        if ep.get("episode_index") == episode_index:
-                            trajectory = ep.get("trajectory", [])
-                            break
+                    # Load only this episode's trajectory from disk
+                    trajectory = writer.load_episode_trajectory(benchmark_id, episode_index)
 
                     if not trajectory:
                         return (
+                            gr.Checkbox(visible=False),
                             gr.Slider(visible=False),
                             gr.Row(visible=False),
                             "No turns in this episode.",
@@ -549,14 +602,54 @@ Benchmarking AI agents on sales conversations.
                         )
 
                     max_turns = len(trajectory)
-                    first_turn_display = format_turn_markdown(trajectory[0], 1)
 
-                    return (
-                        gr.Slider(minimum=1, maximum=max_turns, value=1, visible=True),
-                        gr.Row(visible=True),
-                        first_turn_display,
-                        trajectory,
-                    )
+                    if show_all:
+                        # Show all turns in scrollable view
+                        display = format_all_turns_markdown(trajectory)
+                        return (
+                            gr.Checkbox(visible=True, value=True),
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
+                            display,
+                            trajectory,
+                        )
+                    else:
+                        # Show single turn with navigation
+                        first_turn_display = format_turn_markdown(trajectory[0], 1)
+                        return (
+                            gr.Checkbox(visible=True, value=False),
+                            gr.Slider(minimum=1, maximum=max_turns, value=1, visible=True),
+                            gr.Row(visible=True),
+                            first_turn_display,
+                            trajectory,
+                        )
+
+                def toggle_view_mode(show_all, trajectory):
+                    """Toggle between single-turn and all-turns view."""
+                    if not trajectory:
+                        return (
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
+                            "",
+                        )
+
+                    if show_all:
+                        # Show all turns in scrollable view
+                        display = format_all_turns_markdown(trajectory)
+                        return (
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
+                            display,
+                        )
+                    else:
+                        # Show single turn with navigation
+                        max_turns = len(trajectory)
+                        first_turn_display = format_turn_markdown(trajectory[0], 1)
+                        return (
+                            gr.Slider(minimum=1, maximum=max_turns, value=1, visible=True),
+                            gr.Row(visible=True),
+                            first_turn_display,
+                        )
 
                 def display_turn(turn_number, trajectory):
                     """Display a specific turn."""
@@ -591,18 +684,31 @@ Benchmarking AI agents on sales conversations.
                     outputs=[
                         traces_status,
                         episode_dropdown,
+                        show_all_turns,
                         turn_slider,
                         nav_row,
                         turn_display,
                         current_trajectory,
-                        current_traces,
+                        current_benchmark_id,
                     ],
                 )
 
                 episode_dropdown.change(
                     fn=load_episode_trajectory,
-                    inputs=[episode_dropdown, current_traces],
-                    outputs=[turn_slider, nav_row, turn_display, current_trajectory],
+                    inputs=[episode_dropdown, current_benchmark_id, show_all_turns],
+                    outputs=[
+                        show_all_turns,
+                        turn_slider,
+                        nav_row,
+                        turn_display,
+                        current_trajectory,
+                    ],
+                )
+
+                show_all_turns.change(
+                    fn=toggle_view_mode,
+                    inputs=[show_all_turns, current_trajectory],
+                    outputs=[turn_slider, nav_row, turn_display],
                 )
 
                 turn_slider.change(

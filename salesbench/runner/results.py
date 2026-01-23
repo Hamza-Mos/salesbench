@@ -455,16 +455,17 @@ class BenchmarkResult:
             total_cost = total_cost + e.cost_breakdown
 
         # Extract time metrics from episode metrics
-        action_based_minutes = [
-            e.metrics.get("action_based_minutes", 0) for e in completed
-        ]
-        token_based_minutes = [
-            e.metrics.get("token_based_minutes", 0) for e in completed
-        ]
-        conversation_turns = [
-            e.metrics.get("conversation_turns", 0) for e in completed
-        ]
+        action_based_minutes = [e.metrics.get("action_based_minutes", 0) for e in completed]
+        token_based_minutes = [e.metrics.get("token_based_minutes", 0) for e in completed]
+        conversation_turns = [e.metrics.get("conversation_turns", 0) for e in completed]
         total_calls = [e.total_calls for e in completed]
+
+        # Aggregate lead outcome metrics
+        total_leads = sum(e.metrics.get("total_leads", 0) for e in completed)
+        leads_contacted = sum(e.metrics.get("leads_contacted", 0) for e in completed)
+        leads_converted = sum(e.metrics.get("leads_converted", 0) for e in completed)
+        leads_dnc = sum(e.metrics.get("leads_dnc", 0) for e in completed)
+        leads_uncontacted = sum(e.metrics.get("leads_uncontacted", 0) for e in completed)
 
         metrics = {
             "n_episodes": n,
@@ -486,9 +487,15 @@ class BenchmarkResult:
             "total_duration_seconds": sum(durations),
             "mean_episode_duration": statistics.mean(durations),
             # Time metrics (new)
-            "mean_action_based_minutes": statistics.mean(action_based_minutes) if action_based_minutes else 0,
-            "mean_token_based_minutes": statistics.mean(token_based_minutes) if token_based_minutes else 0,
-            "mean_conversation_turns": statistics.mean(conversation_turns) if conversation_turns else 0,
+            "mean_action_based_minutes": statistics.mean(action_based_minutes)
+            if action_based_minutes
+            else 0,
+            "mean_token_based_minutes": statistics.mean(token_based_minutes)
+            if token_based_minutes
+            else 0,
+            "mean_conversation_turns": statistics.mean(conversation_turns)
+            if conversation_turns
+            else 0,
             "mean_calls": statistics.mean(total_calls) if total_calls else 0,
             "mean_offers": self.total_accepts / n if n > 0 else 0,
             # Token usage
@@ -501,7 +508,18 @@ class BenchmarkResult:
             # End call metrics
             "total_end_calls": sum(e.metrics.get("end_calls", 0) for e in completed),
             # Conversion rate (accepts / total calls)
-            "conversion_rate": self.total_accepts / sum(e.total_calls for e in completed) if sum(e.total_calls for e in completed) > 0 else 0,
+            "conversion_rate": self.total_accepts / sum(e.total_calls for e in completed)
+            if sum(e.total_calls for e in completed) > 0
+            else 0,
+            # Lead outcome metrics (aggregate across all episodes)
+            "total_leads": total_leads,
+            "total_leads_contacted": leads_contacted,
+            "total_leads_converted": leads_converted,
+            "total_leads_dnc": leads_dnc,
+            "total_leads_uncontacted": leads_uncontacted,
+            "mean_leads_per_episode": total_leads / n if n > 0 else 0,
+            "mean_leads_contacted_per_episode": leads_contacted / n if n > 0 else 0,
+            "lead_contact_rate": leads_contacted / total_leads if total_leads > 0 else 0,
         }
 
         self.aggregate_metrics = metrics
