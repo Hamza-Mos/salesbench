@@ -343,8 +343,11 @@ class Orchestrator:
                     skip_result = ToolResult(
                         call_id=tc.call_id,
                         success=True,  # Not a failure, just a no-op
-                        data={"skipped": True, "reason": "no_active_call"},
-                        message="Skipped: No active call to end. Start a call first.",
+                        data={
+                            "skipped": True,
+                            "reason": "no_active_call",
+                            "message": "Skipped: No active call to end. Start a call first.",
+                        },
                     )
                     tool_results.append(skip_result)
                     logger.info(f"[TOOL][SKIP] {tc.tool_name} - no active call")
@@ -354,8 +357,11 @@ class Orchestrator:
                     skip_result = ToolResult(
                         call_id=tc.call_id,
                         success=True,  # Not a failure, just a no-op
-                        data={"skipped": True, "reason": "no_active_call"},
-                        message="Skipped: Cannot propose plan without active call. Use calling.start_call first.",
+                        data={
+                            "skipped": True,
+                            "reason": "no_active_call",
+                            "message": "Skipped: Cannot propose plan without active call. Use calling.start_call first.",
+                        },
                     )
                     tool_results.append(skip_result)
                     logger.info(f"[TOOL][SKIP] {tc.tool_name} - no active call")
