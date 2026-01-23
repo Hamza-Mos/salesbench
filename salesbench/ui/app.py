@@ -91,16 +91,35 @@ def format_turn_markdown(turn: dict, turn_number: int) -> str:
     return "\n\n".join(parts)
 
 
-def format_all_turns_markdown(trajectory: list[dict]) -> str:
-    """Format all turns in a trajectory for display in a scrollable view."""
+TURNS_PER_PAGE = 10  # Limit turns per page to prevent browser crashes
+
+
+def format_all_turns_markdown(trajectory: list[dict], page: int = 1) -> str:
+    """Format turns in a trajectory for display with pagination.
+
+    Args:
+        trajectory: List of turn dictionaries.
+        page: Page number (1-indexed).
+
+    Returns:
+        Formatted markdown string for the current page.
+    """
     if not trajectory:
         return "No turns to display."
 
-    parts = [f"# Full Conversation ({len(trajectory)} turns)\n"]
+    total_turns = len(trajectory)
+    total_pages = (total_turns + TURNS_PER_PAGE - 1) // TURNS_PER_PAGE
+    page = max(1, min(page, total_pages))
+
+    start_idx = (page - 1) * TURNS_PER_PAGE
+    end_idx = min(start_idx + TURNS_PER_PAGE, total_turns)
+
+    parts = [f"# Conversation Turns {start_idx + 1}-{end_idx} of {total_turns}\n"]
+    parts.append(f"**Page {page} of {total_pages}**\n")
     parts.append("---\n")
 
-    for i, turn in enumerate(trajectory):
-        parts.append(format_turn_markdown(turn, i + 1))
+    for i in range(start_idx, end_idx):
+        parts.append(format_turn_markdown(trajectory[i], i + 1))
         parts.append("\n---\n")
 
     return "\n".join(parts)
@@ -386,8 +405,8 @@ Benchmarking AI agents on sales conversations.
 ### Metrics Explained
 - **Score**: Composite score based on sales outcomes (higher is better)
 - **Accept%**: Percentage of offers accepted by buyers
-- **Tokens**: Total tokens used (seller + buyer)
-- **Cost**: Estimated API cost based on token usage
+- **Tokens**: Total tokens used across all episodes (seller + buyer)
+- **Cost**: Exact API cost based on token usage and model pricing
 - **Duration**: Total wall-clock time for benchmark run
                 """)
 
@@ -492,9 +511,9 @@ Benchmarking AI agents on sales conversations.
                     visible=False,
                 )
 
-                # Toggle for viewing all turns at once
+                # Toggle for viewing multiple turns at once (paginated)
                 show_all_turns = gr.Checkbox(
-                    label="Show all turns (scrollable view)",
+                    label="Show multiple turns per page (10 turns/page)",
                     value=False,
                     visible=False,
                 )
@@ -508,15 +527,30 @@ Benchmarking AI agents on sales conversations.
                     visible=False,
                 )
 
+                # Page slider for paginated view
+                page_slider = gr.Slider(
+                    minimum=1,
+                    maximum=1,
+                    step=1,
+                    value=1,
+                    label="Page",
+                    visible=False,
+                )
+
                 with gr.Row(visible=False) as nav_row:
                     prev_btn = gr.Button("Previous Turn", size="sm")
                     next_btn = gr.Button("Next Turn", size="sm")
 
+                with gr.Row(visible=False) as page_nav_row:
+                    prev_page_btn = gr.Button("Previous Page", size="sm")
+                    next_page_btn = gr.Button("Next Page", size="sm")
+
                 turn_display = gr.Markdown("")
 
-                # State to store current trajectory and benchmark ID
+                # State to store current trajectory, benchmark ID, and page
                 current_trajectory = gr.State([])
                 current_benchmark_id = gr.State(None)
+                current_page = gr.State(1)
 
                 def check_traces_available(benchmark_id):
                     """Check if traces exist and load episode list (metadata only)."""
@@ -526,10 +560,13 @@ Benchmarking AI agents on sales conversations.
                             gr.Dropdown(choices=[], visible=False),
                             gr.Checkbox(visible=False),
                             gr.Slider(visible=False),
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
                             gr.Row(visible=False),
                             "",
                             [],
                             None,
+                            1,
                         )
 
                     has_traces = writer.has_traces(benchmark_id)
@@ -539,10 +576,13 @@ Benchmarking AI agents on sales conversations.
                             gr.Dropdown(choices=[], visible=False),
                             gr.Checkbox(visible=False),
                             gr.Slider(visible=False),
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
                             gr.Row(visible=False),
                             "",
                             [],
                             None,
+                            1,
                         )
 
                     # Load only episode metadata, not full trajectories (memory efficient)
@@ -553,10 +593,13 @@ Benchmarking AI agents on sales conversations.
                             gr.Dropdown(choices=[], visible=False),
                             gr.Checkbox(visible=False),
                             gr.Slider(visible=False),
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
                             gr.Row(visible=False),
                             "",
                             [],
                             None,
+                            1,
                         )
 
                     episode_choices = []
@@ -572,10 +615,13 @@ Benchmarking AI agents on sales conversations.
                         gr.Dropdown(choices=episode_choices, visible=True, value=None),
                         gr.Checkbox(visible=False, value=False),
                         gr.Slider(visible=False),
+                        gr.Slider(visible=False),
+                        gr.Row(visible=False),
                         gr.Row(visible=False),
                         "",
                         [],
                         benchmark_id,
+                        1,
                     )
 
                 def load_episode_trajectory(episode_index, benchmark_id, show_all):
@@ -584,9 +630,12 @@ Benchmarking AI agents on sales conversations.
                         return (
                             gr.Checkbox(visible=False),
                             gr.Slider(visible=False),
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
                             gr.Row(visible=False),
                             "",
                             [],
+                            1,
                         )
 
                     # Load only this episode's trajectory from disk
@@ -596,22 +645,29 @@ Benchmarking AI agents on sales conversations.
                         return (
                             gr.Checkbox(visible=False),
                             gr.Slider(visible=False),
+                            gr.Slider(visible=False),
+                            gr.Row(visible=False),
                             gr.Row(visible=False),
                             "No turns in this episode.",
                             [],
+                            1,
                         )
 
                     max_turns = len(trajectory)
+                    total_pages = (max_turns + TURNS_PER_PAGE - 1) // TURNS_PER_PAGE
 
                     if show_all:
-                        # Show all turns in scrollable view
-                        display = format_all_turns_markdown(trajectory)
+                        # Show paginated view (10 turns per page)
+                        display = format_all_turns_markdown(trajectory, page=1)
                         return (
                             gr.Checkbox(visible=True, value=True),
                             gr.Slider(visible=False),
+                            gr.Slider(minimum=1, maximum=total_pages, value=1, visible=True),
                             gr.Row(visible=False),
+                            gr.Row(visible=True),
                             display,
                             trajectory,
+                            1,
                         )
                     else:
                         # Show single turn with navigation
@@ -619,36 +675,50 @@ Benchmarking AI agents on sales conversations.
                         return (
                             gr.Checkbox(visible=True, value=False),
                             gr.Slider(minimum=1, maximum=max_turns, value=1, visible=True),
+                            gr.Slider(visible=False),
                             gr.Row(visible=True),
+                            gr.Row(visible=False),
                             first_turn_display,
                             trajectory,
+                            1,
                         )
 
                 def toggle_view_mode(show_all, trajectory):
-                    """Toggle between single-turn and all-turns view."""
+                    """Toggle between single-turn and paginated view."""
                     if not trajectory:
                         return (
                             gr.Slider(visible=False),
-                            gr.Row(visible=False),
-                            "",
-                        )
-
-                    if show_all:
-                        # Show all turns in scrollable view
-                        display = format_all_turns_markdown(trajectory)
-                        return (
                             gr.Slider(visible=False),
                             gr.Row(visible=False),
+                            gr.Row(visible=False),
+                            "",
+                            1,
+                        )
+
+                    max_turns = len(trajectory)
+                    total_pages = (max_turns + TURNS_PER_PAGE - 1) // TURNS_PER_PAGE
+
+                    if show_all:
+                        # Show paginated view (10 turns per page)
+                        display = format_all_turns_markdown(trajectory, page=1)
+                        return (
+                            gr.Slider(visible=False),
+                            gr.Slider(minimum=1, maximum=total_pages, value=1, visible=True),
+                            gr.Row(visible=False),
+                            gr.Row(visible=True),
                             display,
+                            1,
                         )
                     else:
                         # Show single turn with navigation
-                        max_turns = len(trajectory)
                         first_turn_display = format_turn_markdown(trajectory[0], 1)
                         return (
                             gr.Slider(minimum=1, maximum=max_turns, value=1, visible=True),
+                            gr.Slider(visible=False),
                             gr.Row(visible=True),
+                            gr.Row(visible=False),
                             first_turn_display,
+                            1,
                         )
 
                 def display_turn(turn_number, trajectory):
@@ -674,6 +744,27 @@ Benchmarking AI agents on sales conversations.
                     new_turn = min(len(trajectory), int(current) + 1)
                     return new_turn, display_turn(new_turn, trajectory)
 
+                def display_page(page_number, trajectory):
+                    """Display a specific page of turns."""
+                    if not trajectory:
+                        return ""
+                    return format_all_turns_markdown(trajectory, page=int(page_number))
+
+                def prev_page(current, trajectory):
+                    """Navigate to previous page."""
+                    if not trajectory:
+                        return 1, "", 1
+                    new_page = max(1, int(current) - 1)
+                    return new_page, display_page(new_page, trajectory), new_page
+
+                def next_page(current, trajectory):
+                    """Navigate to next page."""
+                    if not trajectory:
+                        return 1, "", 1
+                    total_pages = (len(trajectory) + TURNS_PER_PAGE - 1) // TURNS_PER_PAGE
+                    new_page = min(total_pages, int(current) + 1)
+                    return new_page, display_page(new_page, trajectory), new_page
+
                 def refresh_trace_choices():
                     return gr.Dropdown(choices=get_run_choices())
 
@@ -686,10 +777,13 @@ Benchmarking AI agents on sales conversations.
                         episode_dropdown,
                         show_all_turns,
                         turn_slider,
+                        page_slider,
                         nav_row,
+                        page_nav_row,
                         turn_display,
                         current_trajectory,
                         current_benchmark_id,
+                        current_page,
                     ],
                 )
 
@@ -699,22 +793,42 @@ Benchmarking AI agents on sales conversations.
                     outputs=[
                         show_all_turns,
                         turn_slider,
+                        page_slider,
                         nav_row,
+                        page_nav_row,
                         turn_display,
                         current_trajectory,
+                        current_page,
                     ],
                 )
 
                 show_all_turns.change(
                     fn=toggle_view_mode,
                     inputs=[show_all_turns, current_trajectory],
-                    outputs=[turn_slider, nav_row, turn_display],
+                    outputs=[
+                        turn_slider,
+                        page_slider,
+                        nav_row,
+                        page_nav_row,
+                        turn_display,
+                        current_page,
+                    ],
                 )
 
                 turn_slider.change(
                     fn=display_turn,
                     inputs=[turn_slider, current_trajectory],
                     outputs=[turn_display],
+                )
+
+                def display_page_and_update_state(page_number, trajectory):
+                    """Display page and return page number for state sync."""
+                    return display_page(page_number, trajectory), int(page_number)
+
+                page_slider.change(
+                    fn=display_page_and_update_state,
+                    inputs=[page_slider, current_trajectory],
+                    outputs=[turn_display, current_page],
                 )
 
                 prev_btn.click(
@@ -727,6 +841,18 @@ Benchmarking AI agents on sales conversations.
                     fn=next_turn,
                     inputs=[turn_slider, current_trajectory],
                     outputs=[turn_slider, turn_display],
+                )
+
+                prev_page_btn.click(
+                    fn=prev_page,
+                    inputs=[current_page, current_trajectory],
+                    outputs=[page_slider, turn_display, current_page],
+                )
+
+                next_page_btn.click(
+                    fn=next_page,
+                    inputs=[current_page, current_trajectory],
+                    outputs=[page_slider, turn_display, current_page],
                 )
 
                 trace_refresh_btn.click(
